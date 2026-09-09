@@ -1,5 +1,5 @@
 {
-  "name": "medical",
+  "name": "account-target-manager",
   "version": "1.0.0",
   "devDependencies": {
     "@types/google-apps-script": "^1.0.100"
