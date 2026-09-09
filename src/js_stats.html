@@ -1,0 +1,218 @@
+<script>
+  // ── 統計タブ ─────────────────────────────────────────────────────────────
+
+  let _statsLoaded = false;
+  let _statsLoading = false;
+  let _statsRequestId = 0;
+  let _statsView = "overview";
+  let _statsTargetUser = "";
+  let _statsLastData = null;
+  const _statsCharts = {};
+
+  const STAGE_COLORS = ["#94a3b8", "#3b82f6", "#f59e0b", "#0891b2", "#22c55e"];
+
+  function initStatsTab() {
+    if (_statsLoaded) {
+      _applyStatsView();
+      return;
+    }
+    if (_statsLoading) return;
+    _statsLoading = true;
+    const requestId = ++_statsRequestId;
+    const grid = $("stats-grid");
+    if (grid) grid.style.display = "none";
+    showOverlay("📊 統計データを読み込み中...");
+    google.script.run
+      .withSuccessHandler((data) => {
+        if (requestId !== _statsRequestId) return;
+        _statsLoading = false;
+        _statsLoaded = true;
+        _statsLastData = data;
+        hideOverlay();
+        if (grid) grid.style.display = "grid";
+        _renderStats(data);
+      })
+      .withFailureHandler((e) => {
+        if (requestId !== _statsRequestId) return;
+        _statsLoading = false;
+        hideOverlay();
+        showAlert("統計データの読み込みに失敗しました。\n" + e.message, "読み込みエラー", true);
+      })
+      .getStatistics(_statsTargetUser);
+  }
+
+  function reloadStats() {
+    _statsLoaded = false;
+    _statsLoading = false;
+    _statsLastData = null;
+    Object.values(_statsCharts).forEach((chart) => {
+      if (chart) chart.destroy();
+    });
+    Object.keys(_statsCharts).forEach((key) => delete _statsCharts[key]);
+    if ($("chart-users-card")) $("chart-users-card").style.display = "none";
+    initStatsTab();
+  }
+
+  function switchStatsView(view) {
+    _statsView = view === "activity" ? "activity" : "overview";
+    document.querySelectorAll("#stats-tabs .stats-tab").forEach((button) => {
+      button.classList.toggle("active", button.dataset.view === _statsView);
+    });
+    _applyStatsView();
+  }
+
+  function onStatsUserChange() {
+    const select = $("stats-user-select");
+    _statsTargetUser = select ? select.value : "";
+    reloadStats();
+  }
+
+  function _renderStats(data) {
+    _populateStatsUserFilter(data);
+
+    _statsCharts.stage = new Chart($("chart-stage"), {
+      type: "doughnut",
+      data: {
+        labels: STAGE_LABELS,
+        datasets: [
+          {
+            data: ["0", "1", "2", "3", "4"].map((s) => data.stageCounts[s] || 0),
+            backgroundColor: STAGE_COLORS,
+            borderWidth: 1,
+            borderColor: "#fff",
+          },
+        ],
+      },
+      options: {
+        maintainAspectRatio: false,
+        plugins: { legend: { position: "bottom" } },
+        cutout: "60%",
+      },
+    });
+
+    _statsCharts.closing = new Chart($("chart-closing"), {
+      type: "doughnut",
+      data: {
+        labels: ["進行中", "受注", "失注"],
+        datasets: [
+          {
+            data: [data.closing.inProgress, data.closing.won, data.closing.lost],
+            backgroundColor: ["#3b82f6", "#22c55e", "#ef4444"],
+            borderWidth: 1,
+            borderColor: "#fff",
+          },
+        ],
+      },
+      options: {
+        maintainAspectRatio: false,
+        plugins: { legend: { position: "bottom" } },
+        cutout: "60%",
+      },
+    });
+
+    _statsCharts.monthly = new Chart($("chart-monthly"), {
+      type: "bar",
+      data: {
+        labels: data.monthlyLogs.map((m) => m.month),
+        datasets: [
+          {
+            label: "活動件数",
+            data: data.monthlyLogs.map((m) => m.count),
+            backgroundColor: "rgba(8,145,178,0.7)",
+            borderRadius: 4,
+          },
+        ],
+      },
+      options: {
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: { y: { beginAtZero: true, ticks: { stepSize: 1 } } },
+      },
+    });
+
+    if (data.isAll && data.userCounts && data.userCounts.length > 0) {
+      const userCanvas = $("chart-users");
+      _statsCharts.users = new Chart(userCanvas, {
+        type: "bar",
+        data: {
+          labels: data.userCounts.map((u) => u.name),
+          datasets: [
+            {
+              label: "案件数",
+              data: data.userCounts.map((u) => u.count),
+              backgroundColor: "rgba(15,23,42,0.7)",
+              borderRadius: 4,
+            },
+          ],
+        },
+        options: {
+          maintainAspectRatio: false,
+          indexAxis: "y",
+          plugins: { legend: { display: false } },
+          scales: { x: { beginAtZero: true, ticks: { stepSize: 1 }, position: "top" } },
+        },
+      });
+    }
+
+    _applyStatsView();
+  }
+
+  function _populateStatsUserFilter(data) {
+    const filter = $("stats-user-filter");
+    const select = $("stats-user-select");
+    if (!filter || !select) return;
+
+    if (!data.isAll) {
+      filter.style.display = "none";
+      _statsTargetUser = "";
+      return;
+    }
+
+    filter.style.display = "flex";
+    const users = data.userCounts || [];
+    select.innerHTML =
+      '<option value="">全体</option>' +
+      users
+        .map(
+          (u) =>
+            `<option value="${_escapeHtml(u.uid || "")}">${_escapeHtml(u.name || u.uid)}</option>`,
+        )
+        .join("");
+    select.value = users.some((u) => u.uid === _statsTargetUser)
+      ? _statsTargetUser
+      : "";
+    _statsTargetUser = select.value;
+  }
+
+  function _applyStatsView() {
+    const data = _statsLastData;
+    const isOverview = _statsView === "overview";
+    const showUsers = !!(
+      data &&
+      data.isAll &&
+      !_statsTargetUser &&
+      data.userCounts &&
+      data.userCounts.length > 0
+    );
+
+    document
+      .querySelectorAll(".stats-card-overview")
+      .forEach((card) => (card.style.display = isOverview ? "flex" : "none"));
+    document.querySelectorAll(".stats-card-activity").forEach((card) => {
+      card.style.display = !isOverview ? "flex" : "none";
+      card.style.gridColumn = "";
+    });
+
+    const monthlyCard = $("chart-monthly") ? $("chart-monthly").closest(".card") : null;
+    const usersCard = $("chart-users-card");
+    if (usersCard) usersCard.style.display = !isOverview && showUsers ? "flex" : "none";
+    if (monthlyCard) monthlyCard.style.gridColumn = !isOverview && !showUsers ? "1 / -1" : "";
+
+    setTimeout(() => {
+      Object.values(_statsCharts).forEach((chart) => {
+        if (chart) chart.resize();
+      });
+    }, 0);
+  }
+
+</script>

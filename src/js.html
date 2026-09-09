@@ -1,0 +1,476 @@
+<script>
+  // js.html — 初期化・全体制御
+
+  // --- 日付管理 ---
+  let nowDate = new Date();
+  let currentMonth = nowDate.getMonth() + 1;
+  let currentYear = nowDate.getFullYear();
+
+  let t0HospId = "";
+  let t1HospId = "";
+  let t3HospId = "new";
+  let currentStageFilter = "all";
+
+  function canUseTargetUserSelector() {
+    return currentUserRole === "leader" || currentUserRole === "member";
+  }
+
+  function getTabTargetUser(tabIdx) {
+    return tabIdx === 1 ? currentTargetUserT1 : currentTargetUserT0;
+  }
+
+  function isOtherUserMode(tabIdx) {
+    return canUseTargetUserSelector() && getTabTargetUser(tabIdx) !== "self";
+  }
+
+  function getOtherAccountsForTarget(targetUser) {
+    const accounts = db.otherAccounts || [];
+    if (targetUser === "others") return accounts;
+    return accounts.filter((h) => h.assignedUserId === targetUser);
+  }
+
+  function getAccountsForTab(tabIdx) {
+    if (tabIdx === 3) return db.accounts;
+    if (!isOtherUserMode(tabIdx)) return db.accounts;
+    return getOtherAccountsForTarget(getTabTargetUser(tabIdx));
+  }
+
+  function initTargetUserSelectors() {
+    const visible = canUseTargetUserSelector();
+    [0, 1].forEach((tabIdx) => {
+      const wrap = $(`t${tabIdx}-target-user-wrap`);
+      const select = $(`t${tabIdx}-target-user`);
+      if (!wrap || !select) return;
+      wrap.style.display = visible ? "flex" : "none";
+      if (!visible) return;
+
+      const users = allUsers
+        .filter(
+          (u) =>
+            (u.role === "leader" || u.role === "member") &&
+            u.email !== currentUserEmail,
+        )
+        .sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""), "ja"));
+      select.innerHTML =
+        `<option value="self">自分</option><option value="others">他担当者</option>` +
+        users.map((u) => `<option value="${u.email}">${u.name}</option>`).join("");
+      select.value = getTabTargetUser(tabIdx);
+    });
+  }
+
+  function handleTargetUserChange(tabIdx, value) {
+    collectBasicInfo();
+    if (tabIdx === 0) {
+      currentTargetUserT0 = value || "self";
+      t0HospId = "";
+      if (typeof cancelEditLog === "function") cancelEditLog();
+    }
+    if (tabIdx === 1) {
+      currentTargetUserT1 = value || "self";
+      const accounts = getAccountsForTab(1);
+      t1HospId = accounts.length > 0 ? accounts[0].id : "";
+    }
+    updateAccountSelectOptions();
+    updateOtherUserReadonlyState();
+    renderAll();
+    if (value && value !== "self") prefetchOtherAccounts(value);
+    if (tabIdx === 1 && t1HospId) changeAccount(1, t1HospId);
+  }
+
+  function updateOtherUserReadonlyState() {
+    const form = $("log-input-form");
+    if (form) {
+      form.style.display =
+        currentUserRole === "manager" || isOtherUserMode(0) ? "none" : "";
+    }
+    const tab0 = $("tab0");
+    if (tab0) tab0.classList.toggle("other-user-mode", isOtherUserMode(0));
+    const csvBtns = $("csv-export-btns");
+    if (csvBtns) csvBtns.style.display = isOtherUserMode(0) ? "none" : "flex";
+    const reportBtn = $("project-report-export-btn");
+    if (reportBtn) reportBtn.style.display = "";
+  }
+
+  function mergeOtherAccountDetail(accountId, detail) {
+    db.departments = db.departments.filter((d) => d.accountId !== accountId);
+    db.projects = db.projects.filter((p) => p.accountId !== accountId);
+    db.logs = db.logs.filter((l) => l.accountId !== accountId);
+    db.departments.push(...(detail.departments || []));
+    db.projects.push(...(detail.projects || []));
+    db.logs.push(...(detail.logs || []));
+  }
+
+  function rehydrateOtherAccountCache() {
+    Object.keys(otherAccountCache).forEach((accountId) => {
+      mergeOtherAccountDetail(accountId, otherAccountCache[accountId]);
+    });
+  }
+
+  function prefetchOtherAccounts(userId) {
+    if (!userId || userId === "self" || _prefetchPromise[userId]) return;
+
+    const hospIds = (db.otherAccounts || [])
+      .filter((h) => userId === "others" || h.assignedUserId === userId)
+      .map((h) => h.id);
+    const uncached = hospIds.filter((id) => !otherAccountCache[id]);
+    if (uncached.length === 0) return;
+
+    _prefetchPromise[userId] = new Promise((resolve) => {
+      google.script.run
+        .withSuccessHandler((bulkDetail) => {
+          Object.entries(bulkDetail || {}).forEach(([hospId, detail]) => {
+            if (!otherAccountCache[hospId]) {
+              otherAccountCache[hospId] = detail || {};
+              mergeOtherAccountDetail(hospId, otherAccountCache[hospId]);
+            }
+          });
+          delete _prefetchPromise[userId];
+          resolve();
+        })
+        .withFailureHandler(() => {
+          delete _prefetchPromise[userId];
+          resolve();
+        })
+        .getAccountDetailBulk(uncached);
+    });
+  }
+
+  function ensureAccountDetail(accountId) {
+    if (!accountId) return Promise.resolve();
+
+    if (otherAccountCache[accountId]) {
+      mergeOtherAccountDetail(accountId, otherAccountCache[accountId]);
+      return Promise.resolve();
+    }
+
+    const userId = (db.otherAccounts || []).find((h) => h.id === accountId)
+      ?.assignedUserId;
+    const pending = (userId && _prefetchPromise[userId]) || _prefetchPromise.others;
+    if (pending) {
+      showOverlay("データを読み込んでいます...");
+      return pending.then(() => {
+        hideOverlay();
+        if (otherAccountCache[accountId]) {
+          mergeOtherAccountDetail(accountId, otherAccountCache[accountId]);
+          return;
+        }
+        showOverlay("データを読み込んでいます...");
+        return _fetchAccountDetailSingle(accountId);
+      });
+    }
+
+    showOverlay("データを読み込んでいます...");
+    return _fetchAccountDetailSingle(accountId);
+  }
+
+  function _fetchAccountDetailSingle(accountId) {
+    return new Promise((resolve, reject) => {
+      google.script.run
+        .withSuccessHandler((detail) => {
+          otherAccountCache[accountId] = detail || {};
+          mergeOtherAccountDetail(accountId, otherAccountCache[accountId]);
+          hideOverlay();
+          resolve();
+        })
+        .withFailureHandler((e) => {
+          hideOverlay();
+          showError(e, "取引先詳細の取得に失敗しました");
+          reject(e);
+        })
+        .getAccountDetail(accountId);
+    });
+  }
+
+  // --- 初期化 ---
+  function init() {
+    if (typeof initSkeletons === "function") initSkeletons();
+    google.script.run
+      .withSuccessHandler(function (campaigns) {
+        db.activePlans = campaigns || [];
+        if (typeof populateCampaignDatalist === "function") populateCampaignDatalist();
+      })
+      .withFailureHandler(function (e) {
+        console.warn("キャンペーンリスト取得失敗:", e);
+        db.activePlans = [];
+      })
+      .getActivePlans();
+
+    google.script.run
+      .withSuccessHandler(function (serverData) {
+        currentUserEmail = serverData.currentUser.email;
+        currentUserRole = serverData.currentUser.role;
+        targetUserId = currentUserEmail;
+        allUsers = serverData.allUsers || [];
+
+        if (currentUserRole === "admin" || currentUserRole === "manager") {
+          db.accounts = serverData.accounts || [];
+        } else {
+          db.accounts = (serverData.accounts || []).filter(
+            (h) => h.assignedUserId === currentUserEmail,
+          );
+        }
+
+        db.departments = serverData.departments || [];
+        db.projects = serverData.projects || [];
+        db.logs = serverData.logs || [];
+        db.reviews = serverData.reviews || {};
+        db.checkItems = serverData.checkItems || [];
+        db.masterAccounts = serverData.masterAccounts || [];
+        db.otherAccounts = serverData.otherAccounts || [];
+
+        const userName = serverData.currentUser.name;
+        const whoSelect = $("log-next-who");
+        if (whoSelect && whoSelect.options.length > 0) {
+          whoSelect.options[0].value = userName;
+          whoSelect.options[0].textContent = `${userName} (自身)`;
+        }
+
+        const roleName =
+          currentUserRole === "admin"
+            ? "管理者"
+            : currentUserRole === "manager"
+              ? "責任者"
+              : currentUserRole === "leader"
+                ? "リーダー"
+                : "担当";
+        $("user-name-txt").textContent = `${userName} (${roleName})`;
+        $("user-icon-txt").textContent = userName.charAt(0);
+
+        // 管理者・リーダーならサマリーのユーザー選択を表示
+        if (
+          currentUserRole === "admin" ||
+          currentUserRole === "manager" ||
+          currentUserRole === "leader"
+        ) {
+          $("summary-user-select-container").style.display = "flex";
+
+          const selectableUsers =
+            currentUserRole === "manager" || currentUserRole === "leader"
+              ? allUsers.filter(
+                  (u) => u.role === "leader" || u.role === "member",
+                )
+              : allUsers.filter((u) => u.role !== "admin");
+
+          $("summary-user-select").innerHTML = selectableUsers
+            .map(
+              (u) =>
+                `<option value="${u.email}">${u.name} (${u.role})</option>`,
+            )
+            .join("");
+
+          if (
+            selectableUsers.length > 0 &&
+            !selectableUsers.some((u) => u.email === targetUserId)
+          ) {
+            targetUserId = selectableUsers[0].email;
+          }
+
+          $("summary-user-select").value = targetUserId;
+        }
+        // 管理者・責任者なら設問管理タブを表示
+        if (currentUserRole === "admin" || currentUserRole === "manager") {
+          document
+            .querySelectorAll(".admin-only")
+            .forEach((el) => (el.style.display = ""));
+        }
+
+        // 責任者(manager)の制限: Tab 3 と ログ入力フォームを非表示
+        if (currentUserRole === "manager") {
+          document
+            .querySelectorAll(".manager-hidden")
+            .forEach((el) => (el.style.display = "none"));
+          const logForm = $("log-input-form");
+          if (logForm) logForm.style.display = "none";
+        }
+
+        initTargetUserSelectors();
+        updateAccountSelectOptions();
+        updateOtherUserReadonlyState();
+        initRefSelectors();
+
+        if (db.accounts.length > 0) {
+          t0HospId = "";
+          t1HospId = db.accounts[0].id;
+        }
+        t3HospId = "new";
+        changeAccount(3, "new");
+        if ($("log-date"))
+          $("log-date").value = new Date().toISOString().split("T")[0];
+
+        if (currentUserRole === "admin" || currentUserRole === "manager") {
+          google.script.run
+            .withSuccessHandler(function (campaigns) {
+              db.campaigns = campaigns || [];
+              if (typeof renderCampaignList === "function") renderCampaignList();
+            })
+            .withFailureHandler(function (e) {
+              console.warn("キャンペーンリスト(管理用)取得失敗:", e);
+              db.campaigns = [];
+            })
+            .getPlans();
+        }
+
+        switchTab(0);
+      })
+      .withFailureHandler((e) => showError(e, "データの取得に失敗しました"))
+      .getInitialData();
+  }
+
+  function switchTab(idx) {
+    collectBasicInfo();
+    document
+      .querySelectorAll(".content")
+      .forEach((c, i) => c.classList.toggle("active", i === idx));
+    document
+      .querySelectorAll(".tab")
+      .forEach((t, i) => t.classList.toggle("active", i === idx));
+    renderAll();
+    if (idx === 3 && typeof initStatsTab === "function") initStatsTab();
+  }
+
+  function handleT0AccountChange(val) {
+    if (val === "new" && !isOtherUserMode(0)) {
+      openQuickAddModal("full");
+      // Tom Select は native .value では制御できないため setValue で戻す。
+      // これにより①キャンセル後の表示ズレ、②同一値の再選択で onChange が発火しない問題を解消する。
+      if (_tsInstances.t0) _tsInstances.t0.setValue(t0HospId || "", true);
+    } else {
+      changeAccount(0, val);
+    }
+  }
+
+  function updatePartnerDisplay() {
+    const partnerValue = $("h-partner").value;
+    if ($("t3-partner-display"))
+      $("t3-partner-display").textContent = partnerValue ? `担当MS: ${partnerValue}` : "";
+  }
+
+  function updateStageFilter(val) {
+    currentStageFilter = val;
+    renderSummary();
+  }
+
+  function updateHospNameFilter(val) {
+    currentHospNameFilter = val.trim();
+    renderSummary();
+  }
+
+  function saveAll() {
+    collectBasicInfo();
+    // 自分の担当取引先IDセットを確定
+    const myHospIds = new Set(db.accounts.map((h) => h.id));
+    // 送信するのは自分の担当スコープに属するデータだけ
+    const snapshot = {
+      accounts: db.accounts,
+      departments: db.departments.filter((d) => myHospIds.has(d.accountId)),
+      projects: db.projects.filter((p) => myHospIds.has(p.accountId)),
+      logs: db.logs.filter((l) => myHospIds.has(l.accountId)),
+    };
+    showSaving();
+    google.script.run
+      .withSuccessHandler((serverData) => {
+        if (currentUserRole === "admin") {
+          db.accounts = serverData.accounts || [];
+        } else {
+          db.accounts = (serverData.accounts || []).filter(
+            (h) => h.assignedUserId === currentUserEmail,
+          );
+        }
+        db.departments = serverData.departments || [];
+        db.projects = serverData.projects || [];
+        db.logs = serverData.logs || [];
+        db.reviews = serverData.reviews || {};
+        db.checkItems = serverData.checkItems || [];
+        db.masterAccounts = serverData.masterAccounts || [];
+        db.otherAccounts = serverData.otherAccounts || [];
+        rehydrateOtherAccountCache();
+
+        // プルダウンや画面の表示を最新データで書き直す（現在の選択状態は維持されます）
+        updateAccountSelectOptions();
+        renderAll();
+
+        showSuccess();
+      })
+      .withFailureHandler((e) => showErrorWithRetry(e, "クラウド同期に失敗しました", saveAll))
+      .syncMyData(snapshot);
+  }
+
+  // --- Renderers ---
+  function renderAll() {
+    updatePartnerDisplay();
+    updateOtherUserReadonlyState();
+    renderSummary();
+    renderBasicInfo();
+    renderActivities();
+    renderDashboard();
+    renderAdminCheckItems();
+  }
+
+  function renderDashboard() {
+    if (!t1HospId || t1HospId === "new") return;
+    const projs = db.projects.filter((p) => p.accountId === t1HospId);
+    const depts = db.departments.filter((d) => d.accountId === t1HospId);
+    $("dash-active-projects").innerHTML =
+      projs
+        .filter((p) => p.currentStage !== "4")
+        .map((p) => {
+          const dName =
+            depts.find((d) => d.id === p.departmentId)?.name || "未分類";
+          let bars = "";
+          for (let s = 1; s <= 4; s++) {
+            let color =
+              s <= parseInt(p.currentStage || "0")
+                ? "var(--teal)"
+                : "var(--border)";
+            bars += `<div style="height:8px; flex:1; background:${color}; margin-right:2px; border-radius:2px;"></div>`;
+          }
+          return `<div style="margin-bottom:8px;"><div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px;"><strong style="font-size:13px;">[${dName}] ${p.name}${p.targetProduct ? `<span style="font-size:11px; color:var(--gray); font-weight:normal; margin-left:6px;">(${p.targetProduct})</span>` : ""}</strong> <span class="stage stage-${p.currentStage || "0"}">${STAGE_LABELS[p.currentStage || "0"]}</span></div><div style="display:flex;">${bars}</div></div>`;
+        })
+        .join("") || '<div class="section-note">進行中の案件はありません</div>';
+    $("dash-closed-projects").innerHTML =
+      projs
+        .filter((p) => p.currentStage === "4")
+        .map((p) => {
+          const statusLabel =
+            p.closingStatus === "won"
+              ? "🟢 受注"
+              : p.closingStatus === "lost"
+                ? "🔘 失注"
+                : "🟢 受注";
+          const bgColor = p.closingStatus === "lost" ? "#F1F5F9" : "white";
+          const borderColor =
+            p.closingStatus === "lost" ? "#E2E8F0" : "var(--border)";
+          return `<div style="padding:10px; background:${bgColor}; border-radius:6px; margin-bottom:4px; border:1px solid ${borderColor};"><div style="display:flex; justify-content:space-between; align-items:center;"><div style="font-weight:bold; font-size:13px; color:var(--navy);">${p.name}${p.targetProduct ? `<span style="font-size:11px; color:var(--gray); font-weight:normal; margin-left:6px;">(${p.targetProduct})</span>` : ""}</div><div style="font-size:11px; font-weight:bold; color:var(--gray);">${statusLabel}</div></div><div style="font-size:12px; color:var(--text); margin-top:4px; padding-top:6px; border-top:1px dashed ${borderColor};">📝 ${p.latestNote || '<span style="color:var(--gray);">結果未入力</span>'}</div></div>`;
+        })
+        .join("") || '<div class="section-note">実績はありません</div>';
+    $("dash-recent-logs").innerHTML =
+      db.logs
+        .filter((l) => l.accountId === t1HospId && l.visitDate)
+        .sort((a, b) => new Date(b.visitDate) - new Date(a.visitDate))
+        .slice(0, 3)
+        .map((l) => {
+          const p = projs.find((p) => p.id === l.projectId);
+          const dName = p
+            ? depts.find((d) => d.id === p.departmentId)?.name || "未分類"
+            : "未分類";
+          return `<div class="dash-list-item"><div style="color:var(--gray); font-size:11px; margin-bottom:4px;">${l.visitDate} ${l.accompaniedBy && l.accompaniedBy !== "なし" ? `<span style="color:var(--teal); font-weight:bold;">(同行: ${l.accompaniedBy})</span>` : ""}</div><div style="font-weight:600; color:var(--navy); font-size:12px; margin-bottom:4px;">[${dName}] ${p?.name}</div><div style="white-space: pre-wrap;">${l.content}</div></div>`;
+        })
+        .join("") || '<div class="section-note">訪問履歴がありません</div>';
+    $("dash-overdue-actions").innerHTML =
+      projs
+        .filter(
+          (p) =>
+            p.currentStage !== "4" &&
+            p.nextActionDate &&
+            p.nextActionDate < new Date().toISOString().split("T")[0],
+        )
+        .map(
+          (p) =>
+            `<div style="padding:10px; background:white; border-radius:6px; margin-bottom:4px; border:1px solid #FECACA;"><div style="font-weight:bold; color:#DC2626; font-size:13px;">${p.name}</div><div style="font-size:12px; margin-top:4px;">▶ ${p.nextActionText} <br><span style="color:var(--gray);">期限: ${p.nextActionDate}</span></div></div>`,
+        )
+        .join("") ||
+      '<div class="section-note" style="color:#DC2626">期限超過はありません</div>';
+  }
+
+  init();
+</script>

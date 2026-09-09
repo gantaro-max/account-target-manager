@@ -1,0 +1,775 @@
+<script>
+  // js_log.html — 活動ログ管理
+
+  const FILE_MAX_BYTES = 10 * 1024 * 1024; // 10MB
+  const FILE_ALLOWED_TYPES = [
+    "application/pdf",
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "application/vnd.partner-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ];
+
+  function validateUploadFile(file) {
+    if (!file) return null;
+    if (file.size > FILE_MAX_BYTES) {
+      return `ファイルサイズが上限（10MB）を超えています。\n選択したファイル: ${(file.size / 1024 / 1024).toFixed(1)}MB`;
+    }
+    if (!FILE_ALLOWED_TYPES.includes(file.type)) {
+      return `対応していないファイル形式です。\nPDF / 画像（JPG, PNG）/ Excel / Word のみ添付できます。`;
+    }
+    return null;
+  }
+
+  function editLog(id) {
+    if (typeof isOtherUserMode === "function" && isOtherUserMode(0)) return;
+    const log = db.logs.find((l) => l.id === id);
+    if (!log) return;
+    editingLogId = id;
+    $("log-proj-select").value = log.projectId;
+    $("log-date").value = log.visitDate || "";
+    $("log-partner").value = log.accompaniedBy || "なし";
+    $("log-content").value = log.content;
+
+    const safeEstimateUrl = _safeUrl(log.estimateUrl);
+    if (safeEstimateUrl) {
+      $("log-estimate-link-display").innerHTML =
+        `<a href="${_escapeHtml(safeEstimateUrl)}" target="_blank" rel="noopener noreferrer" style="color:var(--teal);">📎 現在の添付ファイルを開く</a>`;
+      $("log-estimate-file").dataset.existingUrl = safeEstimateUrl;
+    } else {
+      $("log-estimate-link-display").innerHTML = "";
+      $("log-estimate-file").dataset.existingUrl = "";
+    }
+    loadProjectDataToForm();
+    $("form-log-title").innerHTML =
+      `<span style="color: var(--amber);">✎ 過去のログを編集中</span>
+          <div style="margin-left:auto; display:flex; gap:8px;">
+            <button class="del-btn" style="color: var(--red); border-color: var(--red); padding:4px 8px; font-size:11px;" onclick="deleteLog('${_escapeInlineJsString(id)}')">🗑️ 削除</button>
+            <button class="control-btn" style="background-color: var(--gray); color: white; border: none; padding:4px 8px; font-size:11px;" onclick="cancelEditLog()">キャンセル</button>
+          </div>`;
+    toggleActionButtons();
+    renderActivities();
+  }
+
+  function cancelEditLog() {
+    editingLogId = null;
+    $("log-date").value = new Date().toISOString().split("T")[0];
+    $("log-content").value = "";
+    const fileInput = $("log-estimate-file");
+    if (fileInput) {
+      fileInput.value = "";
+      fileInput.dataset.existingUrl = "";
+    }
+    const linkDisplay = $("log-estimate-link-display");
+    if (linkDisplay) linkDisplay.innerHTML = "";
+    $("log-partner").value = "なし";
+    $("form-log-title").innerHTML = `新規ログ＆アクションの記録`;
+    loadProjectDataToForm();
+    toggleActionButtons();
+    renderActivities();
+  }
+
+  // ログの削除処理
+  function deleteLog(id) {
+    if (typeof isOtherUserMode === "function" && isOtherUserMode(0)) return;
+    showConfirm("この活動ログを完全に削除しますか？", "⚠️ 削除の確認", () => {
+      // 画面上のデータから削除
+      db.logs = db.logs.filter((l) => l.id !== id);
+      cancelEditLog();
+      renderActivities();
+
+      // バックエンドに削除リクエスト
+      showSaving();
+      google.script.run
+        .withSuccessHandler(showSuccess)
+        .withFailureHandler((e) => showError(e, "活動ログの削除に失敗しました"))
+        .deleteLog(id);
+    });
+  }
+
+  function addLogAndUpdateProject(isSaveLog) {
+    if (typeof isOtherUserMode === "function" && isOtherUserMode(0)) return;
+    const projectId = $("log-proj-select").value;
+    if (!projectId) {
+      showAlert("対象案件を選択してください。", "入力チェック");
+      return;
+    }
+    const date = $("log-date").value;
+    const content = $("log-content").value;
+    const partner = $("log-partner").value;
+    const stage = $("log-stage").value;
+    const note = $("log-note").value;
+
+    // --- ファイルの取得 ---
+    const fileInput = $("log-estimate-file");
+    const file = fileInput ? fileInput.files[0] : null;
+
+    // この案件（projectId）に紐づくログの中から、URLが存在する最新のものを探す
+    const findLatestUrl = () => {
+      const projectLogs = db.logs.filter((l) => l.projectId === projectId);
+      // ログを新しい順（逆順）に確認し、最初に見つかったURLを返す
+      const latestWithUrl = projectLogs
+        .slice()
+        .reverse()
+        .find((l) => l.estimateUrl);
+      return latestWithUrl ? latestWithUrl.estimateUrl : "";
+    };
+
+    if (isSaveLog) {
+      if (!date || !content) {
+        showAlert("訪問日と活動内容は必須です。", "入力チェック");
+        return;
+      }
+
+      const fileError = validateUploadFile(file);
+      if (fileError) {
+        showAlert(fileError, "ファイルエラー", true);
+        return;
+      }
+
+      showSaving(); // 保存中画面を表示
+
+      if (file) {
+        // ファイルが選択されている場合は先にGASへアップロード
+        const reader = new FileReader();
+        reader.onload = function (e) {
+          const base64Data = e.target.result.split(",")[1];
+          const fileObj = {
+            fileName: `${projectId}_${date}_${file.name}`,
+            mimeType: file.type,
+            data: base64Data,
+          };
+          google.script.run
+            .withSuccessHandler(function (res) {
+              if (res.ok) {
+                proceedToSaveLogAndProject(res.url);
+              } else {
+                showError({ message: res.error }, "ファイルのアップロードに失敗しました");
+              }
+            })
+            .withFailureHandler((e) => showError(e, "ファイルのアップロードに失敗しました"))
+            .uploadEstimateFile(fileObj);
+        };
+        reader.readAsDataURL(file);
+      } else {
+        // ファイルがない場合は、既存のURL（編集時）を引き継いで保存
+        const existingUrl = editingLogId
+          ? $("log-estimate-file").dataset.existingUrl || ""
+          : findLatestUrl();
+        proceedToSaveLogAndProject(existingUrl);
+      }
+    } else {
+      // 状況のみ更新する場合
+      proceedToSaveLogAndProject("");
+    }
+
+    // --- 保存処理（内部関数） ---
+    function proceedToSaveLogAndProject(estimateUrl) {
+      const [y, m] = date.split("-");
+
+      if (isSaveLog) {
+        if (editingLogId) {
+          const log = db.logs.find((l) => l.id === editingLogId);
+          if (log) {
+            log.projectId = projectId;
+            log.visitDate = date;
+            log.content = content;
+            log.accompaniedBy = partner;
+            log.estimateUrl = estimateUrl;
+            log.year = parseInt(y);
+            log.month = parseInt(m);
+          }
+          google.script.run
+            .withSuccessHandler(showSuccess)
+            .withFailureHandler((e) => showError(e, "活動ログの保存に失敗しました"))
+            .updateLog(log);
+        } else {
+          const newLog = {
+            id: "l" + Date.now(),
+            projectId,
+            accountId: t0HospId,
+            visitDate: date,
+            content,
+            accompaniedBy: partner,
+            estimateUrl: estimateUrl,
+            year: parseInt(y),
+            month: parseInt(m),
+          };
+          db.logs.push(newLog);
+          google.script.run
+            .withSuccessHandler(showSuccess)
+            .withFailureHandler((e) => showError(e, "活動ログの保存に失敗しました"))
+            .saveLog(newLog);
+        }
+      }
+
+      // 案件状況の更新処理
+      const p = db.projects.find((p) => p.id === projectId);
+      if (p) {
+        p.currentStage = stage;
+        p.latestNote = note;
+        if (stage === "4") {
+          p.closingStatus = document.querySelector(
+            'input[name="log-closing-status"]:checked',
+          ).value;
+          p.nextActionDate = "";
+          p.nextActionText = "";
+          p.nextActionAssignee = "";
+        } else {
+          p.closingStatus = "";
+          p.nextActionDate = $("log-next-date").value;
+          p.nextActionText = $("log-next-text").value;
+          p.nextActionAssignee = $("log-next-who").value;
+        }
+        if (!isSaveLog) showSaving();
+        google.script.run
+          .withSuccessHandler(showSuccess)
+          .withFailureHandler((e) => showError(e, "案件状況の更新に失敗しました"))
+          .updateProject(p);
+      }
+
+      cancelEditLog();
+      renderActivities();
+    }
+  }
+
+  // ------------------------------------
+  // 活動履歴の描画と案件フィルタ
+  // ------------------------------------
+  function renderTimelineLogs() {
+    if (!t0HospId || t0HospId === "new") {
+      if ($("timeline-logs")) {
+        $("timeline-logs").innerHTML =
+          '<div class="section-note">対象取引先を選択してください</div>';
+      }
+      return;
+    }
+    const projs = db.projects.filter((p) => p.accountId === t0HospId);
+    const depts = db.departments.filter((d) => d.accountId === t0HospId);
+    const readOnly = typeof isOtherUserMode === "function" && isOtherUserMode(0);
+    const filterSelect = $("log-filter-proj");
+    const filterProjId = filterSelect ? filterSelect.value : "all";
+
+    $("timeline-logs").innerHTML =
+      db.logs
+        .filter((l) => l.accountId === t0HospId && l.visitDate)
+        .filter((l) => filterProjId === "all" || l.projectId === filterProjId)
+        .sort((a, b) => new Date(b.visitDate) - new Date(a.visitDate))
+        .map((l) => {
+          const p = projs.find((p) => p.id === l.projectId);
+          const dName = p
+            ? depts.find((d) => d.id === p.departmentId)?.name || "未分類"
+            : "未分類";
+          let logBg = "white";
+          let logBorder = "var(--border)";
+          let logAccent = "var(--teal)";
+          let logHover = "#f8fafc";
+          if (p && p.currentStage === "4") {
+            if (p.closingStatus === "won") {
+              logBg = "var(--green-lt)"; logBorder = "#A7F3D0"; logAccent = "var(--green)"; logHover = "#d1fae5";
+            } else if (p.closingStatus === "lost") {
+              logBg = "#F1F5F9"; logBorder = "#E2E8F0"; logAccent = "var(--gray)"; logHover = "#e2e8f0";
+            } else {
+              logBg = "#FEF3C7"; logBorder = "#FDE68A"; logAccent = "var(--amber)"; logHover = "#fde68a";
+            }
+          }
+          const safeLogId = _escapeInlineJsString(l.id);
+          const safeVisitDate = _escapeHtml(l.visitDate);
+          const safeAccompaniedBy = _escapeHtml(l.accompaniedBy);
+          const safeDeptName = _escapeHtml(dName);
+          const safeProjectName = _escapeHtml(p ? p.name || "" : "");
+          const safeTargetProduct = _escapeHtml(p ? p.targetProduct || "" : "");
+          const safeContent = _escapeHtml(l.content || "");
+          const safeEstimateUrl = _safeUrl(l.estimateUrl);
+          const editAttrs = readOnly
+            ? `cursor: default;`
+            : `cursor: pointer;`;
+          const editAction = readOnly ? "" : ` onclick="editLog('${safeLogId}')"`;
+          const editLink = readOnly
+            ? ""
+            : `<div style="text-align:right; margin-top:4px;"><span style="font-size:11px; color:var(--teal); font-weight:bold;">✎ 編集する</span></div>`;
+          const accompaniedHtml = l.accompaniedBy && l.accompaniedBy !== "なし"
+            ? `<span style="color:var(--teal); font-size:11px; font-weight:bold;">👨‍💼 同行: ${safeAccompaniedBy}</span>`
+            : "";
+          const targetProductHtml = safeTargetProduct
+            ? `<span style="font-size:11px; color:var(--gray); font-weight:normal; margin-left:6px;">(${safeTargetProduct})</span>`
+            : "";
+          const estimateHtml = safeEstimateUrl
+            ? `<div style="margin-top: 6px;"><a href="${_escapeHtml(safeEstimateUrl)}" target="_blank" rel="noopener noreferrer" style="color: var(--teal); font-size: 11px; text-decoration: none;">📎 添付ファイルを表示</a></div>`
+            : "";
+          return `<div class="log-item" style="${editAttrs} transition: background 0.2s; background: ${logBg}; border: 1px solid ${logBorder}; border-left: 3px solid ${logAccent};"${editAction} onmouseover="this.style.background='${logHover}'" onmouseout="this.style.background='${logBg}'"><div style="display:flex; justify-content:space-between; margin-bottom:4px;"><span style="color:var(--gray); font-size:11px;">📅 ${safeVisitDate}</span>${accompaniedHtml}</div><div style="font-weight:600; color:var(--navy); margin-bottom:4px;">[${safeDeptName}] ${safeProjectName}${targetProductHtml}</div><div style="color:var(--text); line-height:1.4; white-space: pre-wrap;">${safeContent}</div>${estimateHtml}${editLink}</div>`;
+        })
+        .join("") || '<div class="section-note">訪問履歴がありません</div>';
+  }
+
+  function renderActivities() {
+    if (!t0HospId || t0HospId === "new") {
+      if ($("log-proj-select")) {
+        $("log-proj-select").innerHTML =
+          `<option value="">-- 案件を選択 --</option><option value="new" style="color:var(--teal); font-weight:bold;">＋ 新規案件を登録</option>`;
+        $("log-proj-select").value = "";
+      }
+      if ($("log-filter-proj")) {
+        $("log-filter-proj").innerHTML =
+          `<option value="all">すべての案件</option>`;
+      }
+      if ($("projects-display-list")) {
+        $("projects-display-list").innerHTML =
+          '<div class="section-note">対象取引先を選択してください</div>';
+      }
+      renderTimelineLogs(); // これを呼ぶことで履歴もクリアされる
+      toggleActionButtons();
+
+      return;
+    }
+    const projs = db.projects.filter((p) => p.accountId === t0HospId);
+    const depts = db.departments.filter((d) => d.accountId === t0HospId);
+    const readOnly = typeof isOtherUserMode === "function" && isOtherUserMode(0);
+    const hideClosed = $("hide-closed-cb")
+      ? $("hide-closed-cb").checked
+      : false;
+
+    const currentProjId = $("log-proj-select").value;
+    $("log-proj-select").innerHTML =
+      `<option value="">-- 案件を選択 --</option>` +
+      projs
+        .map((p) => {
+          const dName = depts.find((d) => d.id === p.departmentId)?.name || "";
+          return `<option value="${_escapeHtml(p.id)}">[${_escapeHtml(dName)}] ${_escapeHtml(p.name)}</option>`;
+        })
+        .join("") +
+      (readOnly ? "" : `<option value="new" style="color:var(--teal); font-weight:bold;">＋ 新規案件を登録</option>`);
+
+    if (projs.some((p) => p.id === currentProjId)) {
+      $("log-proj-select").value = currentProjId;
+    } else {
+      $("log-proj-select").value = "";
+    }
+    window._logProjSelectLast = $("log-proj-select").value;
+
+    // フィルタ用セレクトボックスの選択肢を更新
+    const filterSelect = $("log-filter-proj");
+    if (filterSelect) {
+      const currentFilter = filterSelect.value;
+      filterSelect.innerHTML =
+        `<option value="all">すべての案件</option>` +
+        projs.map((p) => `<option value="${_escapeHtml(p.id)}">${_escapeHtml(p.name)}</option>`).join("");
+      if (projs.some((p) => p.id === currentFilter)) {
+        filterSelect.value = currentFilter;
+      } else {
+        filterSelect.value = "all";
+      }
+    }
+
+    // ログ一覧を描画
+    renderTimelineLogs();
+
+    // 以降は既存の projects-display-list の描画処理
+    $("projects-display-list").innerHTML =
+      projs
+        .filter((p) => !(hideClosed && p.currentStage === "4"))
+        .map((p) => {
+          const dept = depts.find((d) => d.id === p.departmentId);
+          const dName = dept?.name || "未分類";
+          const safeProjectId = _escapeInlineJsString(p.id);
+          const safeDeptName = _escapeHtml(dName);
+          const safeProjectName = _escapeHtml(p.name || "");
+          const safeTargetProduct = _escapeHtml(p.targetProduct || "");
+          const safeLatestNote = _escapeHtml(p.latestNote || "-");
+          const safeNextActionDate = _escapeHtml(p.nextActionDate || "-");
+          const safeNextActionText = _escapeHtml(p.nextActionText || "-");
+          const safeNextActionAssignee = _escapeHtml(p.nextActionAssignee || "-");
+          const safeKeymanRole = _escapeHtml(dept?.keymanRole || "");
+          const safeKeymanName = _escapeHtml(dept?.keymanName || "");
+          const stageNum = parseInt(p.currentStage, 10);
+          const safeCurrentStage = stageNum >= 0 && stageNum <= 4 ? String(stageNum) : "0";
+          const keymanStr =
+            dept && (dept.keymanRole || dept.keymanName)
+              ? `<div style="font-size: 11px; color: var(--teal); margin-top: 2px; font-weight: 600;">👤 キーマン: ${safeKeymanRole} ${safeKeymanName}</div>`
+              : "";
+          const isClosed = safeCurrentStage === "4";
+          const isOverdue =
+            !isClosed &&
+            p.nextActionDate &&
+            p.nextActionDate < new Date().toISOString().split("T")[0];
+          let bgColor = "#F8FAFC";
+          let hoverBg = "#F1F5F9";
+          let borderColor = "var(--border)";
+          let statusBadge = "";
+          if (isOverdue) {
+            bgColor = "#fef2f2";
+            hoverBg = "#FEE2E2";
+            borderColor = "#FECACA";
+          } else if (isClosed) {
+            bgColor = "#FEF3C7";
+            hoverBg = "#FDE68A";
+            borderColor = "#FDE68A";
+            if (p.closingStatus === "won") {
+              bgColor = "#ecfdf5";
+              hoverBg = "#D1FAE5";
+              borderColor = "#A7F3D0";
+              statusBadge = `<span style="font-size:12px; font-weight:bold; color:var(--green);">🟢 受注</span>`;
+            } else if (p.closingStatus === "lost") {
+              bgColor = "#F1F5F9";
+              hoverBg = "#E2E8F0";
+              borderColor = "#E2E8F0";
+              statusBadge = `<span style="font-size:12px; font-weight:bold; color:var(--gray);">🔘 失注</span>`;
+            }
+          } else {
+            switch (safeCurrentStage) {
+              case "0":
+                bgColor = "#F1F5F9"; hoverBg = "#E2E8F0"; borderColor = "#E2E8F0";
+                break;
+              case "1":
+                bgColor = "#EFF6FF"; hoverBg = "#DBEAFE"; borderColor = "#BFDBFE";
+                break;
+              case "2":
+                bgColor = "#fffbeb"; hoverBg = "#FEF3C7"; borderColor = "#FDE68A";
+                break;
+              case "3":
+                bgColor = "#e0f2fe"; hoverBg = "#BAE6FD"; borderColor = "#BAE6FD";
+                break;
+            }
+          }
+          let detailsHtml = isClosed
+            ? `<div style="margin-top:4px; padding-top:8px; border-top:1px dashed ${borderColor};"><div style="font-size:11px; color:var(--gray); margin-bottom:2px;">クロージング結果</div><div style="font-weight:500;">${safeLatestNote}</div></div>`
+            : `<div class="grid-2" style="margin-top:4px;"><div><div style="font-size:11px; color:var(--gray); margin-bottom:2px;">最新の課題・メモ</div><div style="font-weight:500;">${safeLatestNote}</div></div></div><div style="display:grid; grid-template-columns: 120px 1fr 100px; gap: 10px; margin-top:4px; padding-top:8px; border-top:1px dashed ${borderColor};"><div><div style="font-size:11px; color:var(--gray); margin-bottom:2px;">次回予定/期限 ${isOverdue ? '<span style="color:var(--red)">(超過)</span>' : ""}</div><div style="font-weight:500; ${isOverdue ? "color:var(--red);" : ""}">${safeNextActionDate}</div></div><div><div style="font-size:11px; color:var(--gray); margin-bottom:2px;">ネクストアクション</div><div style="font-weight:500;">${safeNextActionText}</div></div><div><div style="font-size:11px; color:var(--gray); margin-bottom:2px;">担当</div><div style="font-weight:500;">${safeNextActionAssignee}</div></div></div>`;
+          const isEditingMode = !!editingLogId;
+          const cardAction = readOnly || isEditingMode
+            ? ""
+            : ` onclick="$('log-proj-select').value='${safeProjectId}'; window._logProjSelectLast='${safeProjectId}'; loadProjectDataToForm();"`;
+          const cardCursor = readOnly ? "default" : isEditingMode ? "not-allowed" : "pointer";
+          const cardOpacity = !readOnly && isEditingMode ? "0.45" : "1";
+          const cardHoverBg = isEditingMode ? bgColor : hoverBg;
+          return `<div class="project-card" style="background-color: ${bgColor}; border-color: ${borderColor}; cursor: ${cardCursor}; opacity: ${cardOpacity}; transition: background-color 0.15s, opacity 0.2s;"${cardAction} onmouseover="this.style.backgroundColor='${cardHoverBg}'" onmouseout="this.style.backgroundColor='${bgColor}'"><div style="display:flex; justify-content:space-between; align-items:center;"><div><span class="dept-badge">[${safeDeptName}]</span> <strong style="font-size:15px; margin-left:6px; color:var(--navy);">${safeProjectName}</strong>${safeTargetProduct ? `<span style="font-size:11px; color:var(--gray); font-weight:normal; margin-left:6px;">(${safeTargetProduct})</span>` : ""}${keymanStr}</div><div style="display:flex; align-items:center; gap:8px;">${statusBadge}<span class="stage stage-${safeCurrentStage}">${STAGE_LABELS[safeCurrentStage]}</span><button class="control-btn" style="padding:2px 8px;font-size:11px;" onclick="event.stopPropagation();openStageHistory('${safeProjectId}')">📋 履歴</button></div></div>${detailsHtml}</div>`;
+        })
+        .join("") ||
+      '<div class="section-note">表示する案件がありません。</div>';
+    toggleActionButtons();
+  }
+
+  function openStageHistory(projectId) {
+    const p = db.projects.find(function (proj) {
+      return proj.id === projectId;
+    });
+    const projName = p ? p.name : "";
+    Swal.fire({
+      titleText: projName,
+      html: '<div id="sh-content" style="text-align:center;padding:20px;color:var(--gray);">読み込み中...</div>',
+      width: 520,
+      showConfirmButton: false,
+      showCloseButton: true,
+    });
+    google.script.run
+      .withSuccessHandler(function (history) {
+        const el = document.getElementById("sh-content");
+        if (!el) return;
+        if (!history || history.length === 0) {
+          el.innerHTML =
+            '<div style="padding:20px;color:var(--gray);">変更履歴はありません。</div>';
+          return;
+        }
+        el.innerHTML =
+          '<table style="width:100%;border-collapse:collapse;text-align:left;">' +
+          '<thead><tr style="background:#f8fafc;">' +
+          '<th style="padding:6px 8px;font-size:11px;color:var(--gray);border-bottom:2px solid #e2e8f0;">変更日時</th>' +
+          '<th style="padding:6px 8px;font-size:11px;color:var(--gray);border-bottom:2px solid #e2e8f0;">ステージ</th>' +
+          '<th style="padding:6px 8px;font-size:11px;color:var(--gray);border-bottom:2px solid #e2e8f0;">変更者</th>' +
+          '</tr></thead><tbody>' +
+          history
+            .map(function (h) {
+              const safeAt = _escapeHtml(h.changedAt);
+              const stageNum = parseInt(h.stage, 10);
+              const safeStage = stageNum >= 0 && stageNum <= 4 ? String(stageNum) : "0";
+              const safeBy = _escapeHtml(h.changedBy);
+              const stageLabel = _escapeHtml(
+                STAGE_LABELS[stageNum] != null ? STAGE_LABELS[stageNum] : h.stage,
+              );
+              return (
+                '<tr>' +
+                '<td style="padding:6px 8px;font-size:12px;border-bottom:1px solid #f0f0f0;">' +
+                safeAt +
+                '</td>' +
+                '<td style="padding:6px 8px;font-size:12px;border-bottom:1px solid #f0f0f0;"><span class="stage stage-' +
+                safeStage +
+                '">' +
+                stageLabel +
+                '</span></td>' +
+                '<td style="padding:6px 8px;font-size:12px;border-bottom:1px solid #f0f0f0;color:var(--gray);">' +
+                safeBy +
+                '</td>' +
+                '</tr>'
+              );
+            })
+            .join("") +
+          '</tbody></table>';
+      })
+      .withFailureHandler(function () {
+        const el = document.getElementById("sh-content");
+        if (el) {
+          el.innerHTML =
+            '<div style="padding:20px;color:var(--red);">取得に失敗しました。</div>';
+        }
+      })
+      .getStageHistory(projectId);
+  }
+
+
+  function openUnifiedCsvModal() {
+    Swal.fire({
+      title: "📊 データCSV出力",
+      width: 480,
+      html: `
+      <div style="text-align:left;font-size:13px">
+        <div style="margin-bottom:14px">
+          <div style="font-weight:bold;margin-bottom:6px">① 取引先</div>
+          <select id="u-account" style="width:100%;padding:6px;border:1px solid #ccc;border-radius:4px;font-size:13px"></select>
+        </div>
+        <div style="margin-bottom:14px">
+          <div style="font-weight:bold;margin-bottom:6px">② 案件（任意）</div>
+          <input type="text" id="u-project-filter" placeholder="案件名で絞り込み（部分一致）"
+            style="width:100%;padding:6px;border:1px solid #ccc;border-radius:4px;font-size:13px;box-sizing:border-box;margin-bottom:4px">
+          <select id="u-project" style="width:100%;padding:6px;border:1px solid #ccc;border-radius:4px;font-size:13px"></select>
+        </div>
+        <div style="margin-bottom:4px">
+          <div style="font-weight:bold;margin-bottom:6px">③ 期間</div>
+          <label style="margin-right:12px"><input type="radio" name="u-period" value="all" checked> 全件</label>
+          <label style="margin-right:12px"><input type="radio" name="u-period" value="recent"> 直近1ヶ月</label>
+          <label><input type="radio" name="u-period" value="range"> 期間指定</label>
+          <div id="u-date-range" style="display:none;margin-top:8px;gap:6px;align-items:center">
+            <input type="date" id="u-date-from" style="padding:5px;border:1px solid #ccc;border-radius:4px;font-size:13px">
+            <span style="margin:0 4px">〜</span>
+            <input type="date" id="u-date-to" style="padding:5px;border:1px solid #ccc;border-radius:4px;font-size:13px">
+          </div>
+        </div>
+      </div>`,
+      didOpen: function () {
+        var hospSel = document.getElementById("u-account");
+        hospSel.innerHTML = '<option value="all">全取引先</option>';
+        (db.accounts || []).forEach(function (h) {
+          var opt = document.createElement("option");
+          opt.value = h.id;
+          opt.textContent = h.name;
+          hospSel.appendChild(opt);
+        });
+
+        var allProjects = db.projects || [];
+        function rebuildProjectSelect(filterText) {
+          var projSel = document.getElementById("u-project");
+          var keyword = (filterText || "").trim().toLowerCase();
+          projSel.innerHTML = '<option value="all">全案件</option>';
+          allProjects.forEach(function (p) {
+            if (keyword && String(p.name || "").toLowerCase().indexOf(keyword) === -1) return;
+            var opt = document.createElement("option");
+            opt.value = p.id;
+            opt.textContent = p.name || "";
+            projSel.appendChild(opt);
+          });
+        }
+        rebuildProjectSelect("");
+        document
+          .getElementById("u-project-filter")
+          .addEventListener("input", function () {
+            rebuildProjectSelect(this.value);
+          });
+
+        document.querySelectorAll('input[name="u-period"]').forEach(function (radio) {
+          radio.addEventListener("change", function () {
+            var dr = document.getElementById("u-date-range");
+            dr.style.display = this.value === "range" ? "flex" : "none";
+          });
+        });
+      },
+      showCancelButton: true,
+      confirmButtonText: "📥 CSV出力",
+      cancelButtonText: "キャンセル",
+      preConfirm: function () {
+        var accountId = document.getElementById("u-account").value;
+        var projectId = document.getElementById("u-project").value;
+        var dateMode = document.querySelector('input[name="u-period"]:checked').value;
+        var dateFrom = null;
+        var dateTo = null;
+        if (dateMode === "range") {
+          dateFrom = document.getElementById("u-date-from").value || null;
+          dateTo = document.getElementById("u-date-to").value || null;
+          if (!dateFrom || !dateTo) {
+            Swal.showValidationMessage(
+              "期間指定の場合は開始日と終了日を両方入力してください。",
+            );
+            return false;
+          }
+          if (dateFrom > dateTo) {
+            Swal.showValidationMessage("開始日は終了日以前を指定してください。");
+            return false;
+          }
+        }
+        return {
+          accountId: accountId,
+          projectId: projectId,
+          dateMode: dateMode,
+          dateFrom: dateFrom,
+          dateTo: dateTo,
+        };
+      },
+    }).then(function (result) {
+      if (!result.isConfirmed) return;
+      var params = result.value;
+      Swal.fire({
+        title: "CSV出力中...",
+        allowOutsideClick: false,
+        didOpen: function () {
+          Swal.showLoading();
+        },
+      });
+      google.script.run
+        .withSuccessHandler(function (csv) {
+          Swal.close();
+          if (!csv) {
+            Swal.fire(
+              "該当なし",
+              "条件に一致するデータが見つかりませんでした。",
+              "info",
+            );
+            return;
+          }
+          var blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+          var url = URL.createObjectURL(blob);
+          var a = document.createElement("a");
+          a.href = url;
+          a.download =
+            "データ出力_" + new Date().toISOString().slice(0, 10) + ".csv";
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(function () {
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+          }, 100);
+        })
+        .withFailureHandler(function (e) {
+          Swal.close();
+          Swal.fire("エラー", e.message, "error");
+        })
+        .getUnifiedCsv(params);
+    });
+  }
+
+  function downloadProjectReportCsv() {
+    Swal.fire({
+      title: "📊 案件進捗レポート出力",
+      html:
+        '<input type="text" id="swal-report-query" list="swal-report-datalist"' +
+        ' placeholder="案件名を入力（部分一致）"' +
+        ' style="width:100%; padding:6px 8px; border:1px solid #ccc; border-radius:4px; font-size:14px;">' +
+        '<datalist id="swal-report-datalist"></datalist>',
+      didOpen: function () {
+        var dl = document.getElementById("swal-report-datalist");
+        (db.activePlans || []).forEach(function (campaign) {
+          var opt = document.createElement("option");
+          opt.value = campaign.name;
+          dl.appendChild(opt);
+        });
+        document.getElementById("swal-report-query").focus();
+      },
+      showCancelButton: true,
+      confirmButtonText: "📥 CSV出力",
+      cancelButtonText: "キャンセル",
+      preConfirm: function () {
+        var query = (
+          document.getElementById("swal-report-query").value || ""
+        ).trim();
+        if (!query) {
+          Swal.showValidationMessage("案件名・キャンペーン名を入力してください。");
+          return false;
+        }
+        return query;
+      },
+    }).then(function (result) {
+      if (!result.isConfirmed) return;
+      var query = result.value;
+      Swal.fire({
+        title: "CSV出力中...",
+        allowOutsideClick: false,
+        didOpen: function () {
+          Swal.showLoading();
+        },
+      });
+      google.script.run
+        .withSuccessHandler(function (csv) {
+          Swal.close();
+          if (!csv) {
+            Swal.fire(
+              "該当なし",
+              "条件に一致する案件が見つかりませんでした。",
+              "info",
+            );
+            return;
+          }
+          var blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+          var url = URL.createObjectURL(blob);
+          var a = document.createElement("a");
+          a.href = url;
+          a.download =
+            "案件進捗レポート_" +
+            query +
+            "_" +
+            new Date().toISOString().slice(0, 10) +
+            ".csv";
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(function () {
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+          }, 100);
+        })
+        .withFailureHandler(function (e) {
+          Swal.fire("エラー", e.message, "error");
+        })
+        .getProjectReport(query);
+    });
+  }
+
+
+  function downloadAccountListCsv() {
+    Swal.fire({
+      title: "CSV出力中...",
+      allowOutsideClick: false,
+      didOpen: function () {
+        Swal.showLoading();
+      },
+    });
+    google.script.run
+      .withSuccessHandler(function (csv) {
+        Swal.close();
+        if (!csv) {
+          Swal.fire(
+            "該当なし",
+            "登録された取引先が見つかりませんでした。",
+            "info",
+          );
+          return;
+        }
+        var blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url;
+        a.download =
+          "ターゲット取引先リスト_" +
+          new Date().toISOString().slice(0, 10) +
+          ".csv";
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(function () {
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        }, 100);
+      })
+      .withFailureHandler(function (e) {
+        Swal.fire("エラー", e.message, "error");
+      })
+      .getAccountListCsv();
+  }
+
+</script>

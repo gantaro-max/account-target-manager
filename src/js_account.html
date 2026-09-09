@@ -1,0 +1,442 @@
+<script>
+  const _tsInstances = {}; // Tom Select インスタンス管理 (key: 't0'|'t1'|'t3')
+
+  // js_account.html — 取引先管理
+
+  function _buildHospOpts(includeNew, tabIdx = 0) {
+    const accounts = typeof getAccountsForTab === "function"
+      ? getAccountsForTab(tabIdx)
+      : db.accounts;
+    const isOther = typeof isOtherUserMode === "function" && isOtherUserMode(tabIdx);
+    const opts = accounts.map((h) => ({
+      value: h.id,
+      text: isOther && h.assignedUserName ? `${h.name}（${h.assignedUserName}）` : h.name,
+      group: isOther ? h.assignedUserId : "",
+    }));
+    if (includeNew && !isOther) {
+      opts.push({ value: "new", text: "＋ 新規取引先を登録", isNew: true });
+    }
+    return opts;
+  }
+
+  function _buildHospOptgroups(tabIdx = 0) {
+    if (!(typeof isOtherUserMode === "function" && isOtherUserMode(tabIdx))) return [];
+    const groups = new Map();
+    getAccountsForTab(tabIdx).forEach((h) => {
+      if (!groups.has(h.assignedUserId)) {
+        groups.set(h.assignedUserId, {
+          value: h.assignedUserId,
+          label: h.assignedUserName || h.assignedUserId,
+        });
+      }
+    });
+    return Array.from(groups.values()).sort((a, b) =>
+      String(a.label || "").localeCompare(String(b.label || ""), "ja"),
+    );
+  }
+
+  function _getOrInitTS(key, elId, config) {
+    if (_tsInstances[key]) return _tsInstances[key];
+    const el = $(elId);
+    if (!el) return null;
+    _tsInstances[key] = new TomSelect(el, config);
+    return _tsInstances[key];
+  }
+
+  function _refreshTS(key, opts, value, optgroups = []) {
+    const ts = _tsInstances[key];
+    if (!ts) return;
+    ts.clear(true); // 選択中アイテムを先に解除しないと clearOptions が選択項目をキャッシュに残す
+    ts.clearOptions();
+    if (typeof ts.clearOptionGroups === "function") ts.clearOptionGroups();
+    optgroups.forEach((group) => ts.addOptionGroup(group.value, group));
+    ts.addOptions(opts);
+    ts.setValue(value, true); // silent=true: onChange を発火させない
+  }
+
+  const _tsRender = {
+    option: function (data, escape) {
+      if (data.isNew) {
+        return `<div style="color:var(--teal);font-weight:bold;">${escape(data.text)}</div>`;
+      }
+      return `<div>${escape(data.text)}</div>`;
+    },
+    item: function (data, escape) {
+      if (data.isNew) {
+        return `<span style="color:var(--teal);font-weight:bold;">${escape(data.text)}</span>`;
+      }
+      return `<span>${escape(data.text)}</span>`;
+    },
+    no_results: function () {
+      return `<div class="no-results">該当なし</div>`;
+    },
+  };
+
+  function updateAccountSelectOptions() {
+    // Tab0: 空選択あり + 新規登録
+    _getOrInitTS("t0", "t0-account", {
+      valueField: "value",
+      labelField: "text",
+      searchField: ["text"],
+      maxOptions: null,
+      placeholder: "-- 対象取引先を選択 --",
+      optgroupField: "group",
+      optgroupValueField: "value",
+      optgroupLabelField: "label",
+      lockOptgroupOrder: true,
+      render: _tsRender,
+      onChange: (val) => handleT0AccountChange(val),
+    });
+    _refreshTS("t0", _buildHospOpts(true, 0), t0HospId || "", _buildHospOptgroups(0));
+
+    // Tab1: 取引先一覧のみ（新規登録なし）
+    const t1Accounts = typeof getAccountsForTab === "function" ? getAccountsForTab(1) : db.accounts;
+    if (!t1HospId && t1Accounts.length > 0) t1HospId = t1Accounts[0].id;
+    _getOrInitTS("t1", "t1-account", {
+      valueField: "value",
+      labelField: "text",
+      searchField: ["text"],
+      maxOptions: null,
+      optgroupField: "group",
+      optgroupValueField: "value",
+      optgroupLabelField: "label",
+      lockOptgroupOrder: true,
+      render: _tsRender,
+      onChange: (val) => changeAccount(1, val),
+    });
+    _refreshTS("t1", _buildHospOpts(false, 1), t1HospId || "", _buildHospOptgroups(1));
+
+    // Tab3: 新規登録あり
+    _getOrInitTS("t3", "t3-account", {
+      valueField: "value",
+      labelField: "text",
+      searchField: ["text"],
+      maxOptions: null,
+      render: _tsRender,
+      onChange: (val) => changeAccount(3, val),
+    });
+    _refreshTS("t3", _buildHospOpts(true, 3), t3HospId || "new");
+
+    loadProjectDataToForm();
+  }
+
+  async function changeAccount(tabIdx, id) {
+    collectBasicInfo();
+    if (tabIdx === 0) t0HospId = id;
+    if (tabIdx === 1) t1HospId = id;
+    if (tabIdx === 3) {
+      t3HospId = id;
+      const refSection = $("h-ref-section");
+      const btnDelete = $("btn-delete-hosp");
+      if (id === "new") {
+        if (refSection) refSection.style.display = "block";
+        $("h-code").value = "";
+        $("h-name").value = "";
+        $("h-addr").value = "";
+        $("h-corp").value = "";
+        $("h-beds").value = "";
+        $("h-partner").value = "";
+        $("h-dept-list").value = "";
+        $("h-ward").value = "";
+        $("h-priority").value = "mid";
+        $("h-note").value = "";
+        $("h-equipment").value = "";
+        $("t3-partner-display").textContent = "";
+        $("master-registration-area-dept").style.display = "none";
+        $("master-registration-area-proj").style.display = "none";
+        const btn = $("btn-save-new-hosp");
+        btn.style.display = "inline-block";
+        btn.textContent = "新規登録として保存";
+        btn.onclick = submitNewAccount;
+        if (btnDelete) btnDelete.style.display = "none";
+      } else {
+        if (refSection) refSection.style.display = "none";
+        $("master-registration-area-dept").style.display = "flex";
+        $("master-registration-area-proj").style.display = "flex";
+        const btn = $("btn-save-new-hosp");
+        btn.style.display = "inline-block";
+        btn.textContent = "プロフィールを修正";
+        btn.onclick = updateAccountProfile;
+        if (btnDelete) {
+          if (currentUserRole === "admin") {
+            btnDelete.style.display = "inline-block";
+          } else {
+            btnDelete.style.display = "none";
+          }
+        }
+      }
+    }
+    if (_tsInstances.t0) _tsInstances.t0.setValue(t0HospId || "", true);
+    if (_tsInstances.t1) _tsInstances.t1.setValue(t1HospId || "", true);
+    if (_tsInstances.t3) _tsInstances.t3.setValue(t3HospId || "", true);
+    if ((tabIdx === 0 || tabIdx === 1) && id && id !== "new" && typeof isOtherUserMode === "function" && isOtherUserMode(tabIdx)) {
+      try {
+        await ensureAccountDetail(id);
+      } catch (e) {
+        return;
+      }
+    }
+    if (tabIdx === 0 && typeof cancelEditLog === "function") cancelEditLog();
+    if (tabIdx === 3 && typeof cancelEditProject === "function") cancelEditProject();
+    renderAll();
+    if (tabIdx === 0)
+      setTimeout(() => {
+        loadProjectDataToForm();
+      }, 50);
+  }
+
+  // ============================================================
+  // 取引先重複チェック共通関数
+  // ============================================================
+  /**
+   * _checkDuplicateAccount(name, code, excludeId)
+   * 重複があれば警告メッセージ文字列を返す。問題なければ null を返す。
+   * excludeId: 編集時に自分自身を除外するためのID（新規登録時は ""）
+   *
+   * ルール:
+   *   1. code が空でない → 同一 code が存在する場合は重複
+   *   2. code が空       → 取引先名（trim後）が完全一致する場合は重複
+   */
+  function _checkDuplicateAccount(name, code, excludeId) {
+    const trimName = String(name || "").trim();
+    const trimCode = String(code || "").trim();
+
+    // 名前が空のときはチェック不要（別途必須バリデーションで弾く）
+    if (!trimName) return null;
+
+    const duplicate = db.accounts.find((h) => {
+      // 自分自身（編集時）は除外
+      if (excludeId && h.id === excludeId) return false;
+      if (trimCode !== "") {
+        // code あり → code が空でない既存行と比較（code が入っているもの同士のみ）
+        const hCode = String(h.code || "").trim();
+        return hCode !== "" && hCode === trimCode;
+      } else {
+        // code なし → 自分の担当取引先内で取引先名の完全一致を確認
+        return String(h.name || "").trim() === trimName;
+      }
+    });
+
+    if (!duplicate) return null;
+
+    if (trimCode !== "") {
+      return `同じコード「${trimCode}」の取引先が既に登録されています。\n\n既存: ${duplicate.name}\n\n登録を中止します。`;
+    } else {
+      return `同じ取引先名「${trimName}」が既に登録されています。\n（コードを入力すると同名取引先も区別して登録できます）\n\n登録を中止します。`;
+    }
+  }
+
+  function submitNewAccount() {
+    const newName = $("h-name").value;
+    if (!newName) {
+      showAlert("取引先名を入力してください。", "入力チェック");
+      return;
+    }
+    // ── 重複チェック ──
+    const dupMsg = _checkDuplicateAccount(newName, $("h-code").value, "");
+    if (dupMsg) {
+      showAlert(dupMsg, "重複エラー", true);
+      return;
+    }
+    const newId = "a" + Date.now();
+    const newHosp = {
+      id: newId,
+      code: $("h-code").value,
+      name: newName,
+      addr: $("h-addr").value,
+      corp: $("h-corp").value,
+      beds: $("h-beds").value,
+      partner: $("h-partner").value,
+      deptList: $("h-dept-list").value,
+      ward: $("h-ward").value,
+      priority: $("h-priority").value,
+      equipment: $("h-equipment").value,
+      note: $("h-note").value,
+      assignedUserId: currentUserEmail,
+    };
+
+    showSaving();
+    google.script.run
+      .withSuccessHandler(() => {
+        db.accounts.push(newHosp);
+        t3HospId = newId;
+        updateAccountSelectOptions();
+        changeAccount(3, newId);
+        initRefSelectors();
+        showSuccess();
+      })
+      .withFailureHandler((e) => showError(e, "取引先の新規登録に失敗しました"))
+      .saveNewAccount(newHosp);
+  }
+
+  function updateAccountProfile() {
+    collectBasicInfo();
+    const h = db.accounts.find((h) => h.id === t3HospId);
+    if (h) {
+      showSaving();
+      google.script.run
+        .withSuccessHandler(() => {
+          updateAccountSelectOptions();
+          renderBasicInfo();
+          showSuccess();
+        })
+        .withFailureHandler((e) => showError(e, "取引先情報の更新に失敗しました"))
+        .updateAccount(h);
+    }
+  }
+
+  function handleDeleteAccount() {
+    const hId = t3HospId;
+    if (!hId || hId === "new") return;
+
+    const h = db.accounts.find((item) => item.id === hId);
+    if (!h) return;
+
+    const msg = `取引先「${h.name}」を完全に削除しますか？\n\nこの取引先に紐づくすべての「部署」「案件状況」「活動ログ」が削除され、元に戻すことはできません。`;
+
+    showConfirm(msg, "⚠️ 削除の確認", () => {
+      showSaving();
+      google.script.run
+        .withSuccessHandler(() => {
+          // メモリ上のデータも一括で削除
+          db.accounts = db.accounts.filter((item) => item.id !== hId);
+          db.departments = db.departments.filter(
+            (item) => item.accountId !== hId,
+          );
+          db.projects = db.projects.filter((item) => item.accountId !== hId);
+          db.logs = db.logs.filter((item) => item.accountId !== hId);
+
+          if (t0HospId === hId) t0HospId = "";
+          if (t1HospId === hId) t1HospId = "";
+
+          updateAccountSelectOptions();
+
+          showSuccess();
+          changeAccount(3, "new");
+        })
+        .withFailureHandler((e) => showError(e, "取引先の削除に失敗しました"))
+        .deleteAccountWithCascade(hId);
+    });
+  }
+
+  function renderBasicInfo() {
+    if (t3HospId === "new") return;
+    const h = db.accounts.find((h) => h.id === t3HospId);
+    if (!h) return;
+    $("h-code").value = h.code || "";
+    $("h-name").value = h.name || "";
+    $("h-addr").value = h.addr || "";
+    $("h-corp").value = h.corp || "";
+    $("h-beds").value = h.beds || "";
+    $("h-partner").value = h.partner || "";
+    $("h-dept-list").value = h.deptList || "";
+    $("h-ward").value = h.ward || "";
+    $("h-priority").value = h.priority || "high";
+    $("h-note").value = h.note || "";
+    $("h-equipment").value = h.equipment || "";
+    $("t3-partner-display").textContent = `担当MS: ${h.partner || "未定"}`;
+
+    const depts = db.departments.filter((d) => d.accountId === t3HospId);
+    $("dept-admin-rows").innerHTML =
+      depts
+        .map(
+          (d) => `
+        <div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid #eee; align-items:center;">
+          <div>
+            <div style="font-weight:500; font-size:13px;">${_escapeHtml(d.name)}</div>
+            ${d.keymanRole || d.keymanName ? `<div style="font-size: 11px; color: var(--gray); margin-top: 2px;">👤 ${_escapeHtml(d.keymanRole || "")} ${_escapeHtml(d.keymanName || "")}</div>` : ""}
+          </div>
+          <div style="display:flex; gap:4px;">
+            <button class="control-btn" style="padding: 2px 6px; font-size:12px;" onclick="editDept('${d.id}')">編集</button>
+            <button class="del-btn" style="padding: 2px 6px; font-size:12px;" onclick="delDept('${d.id}')">削除</button>
+          </div>
+        </div>
+      `,
+        )
+        .join("") || '<div class="section-note">部署が登録されていません</div>';
+
+    $("new-proj-dept").innerHTML =
+      `<option value="">-- 対象部署を選択 --</option>` +
+      depts.map((d) => `<option value="${d.id}">${_escapeHtml(d.name)}</option>`).join("");
+    $("project-admin-rows").innerHTML =
+      db.projects
+        .filter((p) => p.accountId === t3HospId)
+        .map((p) => {
+          const dName = depts.find((d) => d.id === p.departmentId)?.name || "";
+          return `
+          <div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid #eee; align-items:center;">
+            <div>
+              <span class="tag" style="background:var(--gray-lt); color:var(--gray);">${_escapeHtml(dName)}</span>
+              <strong style="font-size:13px;">${_escapeHtml(p.name)}</strong>
+              <span style="font-size:11px; color:var(--gray); margin-left:8px;">(${_escapeHtml(p.targetProduct || "")})</span>
+            </div>
+            <div style="display:flex; gap:4px;">
+              <button class="control-btn" style="padding: 2px 6px; font-size:12px;" onclick="editProject('${p.id}')">編集</button>
+              <button class="del-btn" style="padding: 2px 6px; font-size:12px;" onclick="delProject('${p.id}')">削除</button>
+            </div>
+          </div>
+        `;
+        })
+        .join("") || '<div class="section-note">案件が登録されていません</div>';
+  }
+
+  function initRefSelectors() {
+    if (!db.masterAccounts || db.masterAccounts.length === 0) return;
+    const offices = [
+      ...new Set(db.masterAccounts.map((m) => m.office)),
+    ].sort();
+    $("ref-office").innerHTML =
+      '<option value="">-- 拠点を選択 --</option>' +
+      offices.map((o) => `<option value="${o}">${o}</option>`).join("");
+    $("ref-partner").innerHTML = '<option value="">-- 先に拠点を選択 --</option>';
+    $("ref-hosp").innerHTML = '<option value="">-- 先にMSを選択 --</option>';
+  }
+
+  function updateRefPartnerOptions() {
+    const selectedOffice = $("ref-office").value;
+    const partnerList = [
+      ...new Set(
+        db.masterAccounts
+          .filter((m) => m.office === selectedOffice)
+          .map((m) => m.partner),
+      ),
+    ].sort();
+    $("ref-partner").innerHTML =
+      '<option value="">-- 担当MSを選択 --</option>' +
+      partnerList.map((m) => `<option value="${m}">${m}</option>`).join("");
+    $("ref-hosp").innerHTML = '<option value="">-- 先にMSを選択 --</option>';
+  }
+
+  function updateRefAccountOptions() {
+    const selectedOffice = $("ref-office").value;
+    const selectedPartner = $("ref-partner").value;
+    const filteredAccounts = db.masterAccounts.filter(
+      (m) => m.office === selectedOffice && m.partner === selectedPartner,
+    );
+    $("ref-hosp").innerHTML =
+      '<option value="">-- 取引先名を選択 --</option>' +
+      filteredAccounts
+        .map((h) => `<option value="${h.code}">[${h.code}] ${h.name}</option>`)
+        .join("");
+  }
+
+  function applyRefData() {
+    const selectedCode = $("ref-hosp").value;
+    if (!selectedCode) return;
+    const masterHosp = db.masterAccounts.find(
+      (m) => String(m.code) === selectedCode,
+    );
+    if (masterHosp) {
+      $("h-code").value = masterHosp.code;
+      $("h-name").value = masterHosp.name;
+      $("h-partner").value = masterHosp.partner;
+      $("h-addr").value = masterHosp.address || "";
+      updatePartnerDisplay();
+      const refSection = $("h-ref-section");
+      refSection.style.backgroundColor = "#ecfdf5";
+      setTimeout(() => {
+        refSection.style.backgroundColor = "#f1f5f9";
+      }, 1000);
+    }
+  }
+</script>

@@ -1,0 +1,190 @@
+<script>
+  // js_project.html — 案件管理
+
+  function populateCampaignDatalist() {
+    const datalist = $("campaign-datalist");
+    if (!datalist) return;
+    datalist.innerHTML = "";
+    (db.activePlans || []).forEach(function(campaign) {
+      const option = document.createElement("option");
+      option.value = campaign.name;
+      if (campaign.description) option.label = campaign.description;
+      datalist.appendChild(option);
+    });
+  }
+
+  function onCampaignNameInput(nameFieldId, targetFieldId) {
+    const name = $(nameFieldId).value;
+    const campaign = (db.activePlans || []).find(function (p) {
+      return p.name === name;
+    });
+    if (campaign && campaign.item) {
+      $(targetFieldId).value = campaign.item;
+    }
+  }
+
+  function editProject(id) {
+    populateCampaignDatalist();
+    const p = db.projects.find((item) => item.id === id);
+    if (!p) return;
+    editingProjectId = id;
+    $("new-proj-dept").value = p.departmentId;
+    $("new-proj-name").value = p.name;
+    $("new-proj-target").value = p.targetProduct;
+
+    $("project-form-actions").innerHTML = `
+        <button class="save-btn" style="width: 70%" onclick="addProject()">更新</button>
+        <button class="control-btn" style="width: 30%" onclick="cancelEditProject()">戻る</button>
+    `;
+  }
+
+  function cancelEditProject() {
+    populateCampaignDatalist();
+    editingProjectId = null;
+    $("new-proj-name").value = "";
+    $("new-proj-target").value = "";
+    $("project-form-actions").innerHTML =
+      `<button id="btn-project-add" class="add-action-btn" style="width: 100%" onclick="addProject()">案件を追加</button>`;
+  }
+
+  function addProject() {
+    const name = $("new-proj-name").value;
+    const target = $("new-proj-target").value;
+    const dId = $("new-proj-dept").value;
+    if (!name || !dId) return;
+
+    showSaving();
+    if (editingProjectId) {
+      const p = db.projects.find((item) => item.id === editingProjectId);
+      p.name = name;
+      p.targetProduct = target;
+      p.departmentId = dId;
+      google.script.run
+        .withSuccessHandler(() => {
+          showSuccess();
+          cancelEditProject();
+          renderBasicInfo();
+          renderActivities();
+        })
+        .withFailureHandler((e) => showError(e, "案件の保存に失敗しました"))
+        .updateProject(p);
+    } else {
+      const newProj = {
+        id: "p" + Date.now(),
+        departmentId: dId,
+        accountId: t3HospId,
+        name,
+        targetProduct: target,
+        currentStage: "0",
+        latestNote: "",
+        nextActionDate: "",
+        nextActionText: "",
+        nextActionAssignee: $("log-next-who").value,
+        closingStatus: "",
+      };
+      db.projects.push(newProj);
+      google.script.run
+        .withSuccessHandler(() => {
+          showSuccess();
+          cancelEditProject();
+          renderBasicInfo();
+          renderActivities();
+        })
+        .withFailureHandler((e) => showError(e, "案件の保存に失敗しました"))
+        .saveProject(newProj);
+    }
+  }
+
+  function delProject(id) {
+    showConfirm(
+      "この案件を完全に削除しますか？\n※誤って削除した場合、復元できません。",
+      "⚠️ 削除の確認",
+      () => {
+        db.projects = db.projects.filter((p) => p.id !== id);
+        db.logs = db.logs.filter((l) => l.projectId !== id);
+        renderBasicInfo();
+        renderActivities();
+        showSaving();
+        google.script.run
+          .withSuccessHandler(showSuccess)
+          .withFailureHandler((e) => showError(e, "案件の削除に失敗しました"))
+          .deleteProject(id);
+      },
+    );
+  }
+
+  function toggleActionButtons() {
+    const hasContent = $("log-content").value.trim().length > 0;
+    if (editingLogId) {
+      $("btn-save-log-and-proj").style.display = "none";
+      $("btn-save-proj-only").style.display = "none";
+      $("btn-update-log").style.display = "block";
+    } else {
+      $("btn-update-log").style.display = "none";
+      if (hasContent) {
+        $("btn-save-log-and-proj").style.display = "block";
+        $("btn-save-proj-only").style.display = "none";
+      } else {
+        $("btn-save-log-and-proj").style.display = "none";
+        $("btn-save-proj-only").style.display = "block";
+      }
+    }
+  }
+
+  function handleLogProjChange(val) {
+    if (val === "new") {
+      window._logProjSelectPrev = window._logProjSelectLast !== undefined
+        ? window._logProjSelectLast
+        : null;
+      openQuickAddModal("project");
+      $("log-proj-select").value = "";
+    } else {
+      loadProjectDataToForm();
+      window._logProjSelectLast = val;
+    }
+  }
+
+  function loadProjectDataToForm() {
+    const p = db.projects.find((p) => p.id === $("log-proj-select").value);
+    if (p) {
+      $("log-stage").value = p.currentStage || "0";
+      $("log-note").value = p.latestNote || "";
+      $("log-next-date").value = p.nextActionDate || "";
+      $("log-next-text").value = p.nextActionText || "";
+      $("log-next-who").value = p.nextActionAssignee || "";
+      toggleClosingForm(p.currentStage);
+      if (p.currentStage === "4") {
+        const radios = document.getElementsByName("log-closing-status");
+        for (let i = 0; i < radios.length; i++) {
+          if (radios[i].value === p.closingStatus) {
+            radios[i].checked = true;
+            break;
+          }
+        }
+      }
+    } else {
+      $("log-stage").value = "0";
+      $("log-note").value = "";
+      $("log-next-date").value = "";
+      $("log-next-text").value = "";
+
+      const whoSelect = $("log-next-who");
+      if (whoSelect && whoSelect.options.length > 0) {
+        whoSelect.value = whoSelect.options[0].value;
+      }
+
+      toggleClosingForm("0");
+    }
+    toggleActionButtons();
+  }
+
+  function toggleClosingForm(stageValue) {
+    if (stageValue === "4") {
+      $("log-next-action-area").style.display = "none";
+      $("log-closing-area").style.display = "block";
+    } else {
+      $("log-next-action-area").style.display = "block";
+      $("log-closing-area").style.display = "none";
+    }
+  }
+</script>

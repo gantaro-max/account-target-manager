@@ -1,0 +1,100 @@
+<script>
+  // js_department.html — 部署管理
+
+  function editDept(id) {
+    const d = db.departments.find((item) => item.id === id);
+    if (!d) return;
+    editingDeptId = id;
+    $("new-dept-name").value = d.name;
+    $("new-dept-keyman-role").value = d.keymanRole;
+    $("new-dept-keyman-name").value = d.keymanName;
+
+    $("dept-form-actions").innerHTML = `
+      <button class="save-btn" style="width: 70%" onclick="addDept()">更新</button>
+      <button class="control-btn" style="width: 30%" onclick="cancelEditDept()">戻る</button>
+    `;
+  }
+
+  function cancelEditDept() {
+    editingDeptId = null;
+    $("new-dept-name").value = "";
+    $("new-dept-keyman-role").value = "";
+    $("new-dept-keyman-name").value = "";
+    $("dept-form-actions").innerHTML =
+      `<button id="btn-dept-add" class="add-action-btn" style="width: 100%" onclick="addDept()">追加</button>`;
+  }
+
+  function addDept() {
+    const name = $("new-dept-name").value;
+    const role = $("new-dept-keyman-role").value;
+    const kname = $("new-dept-keyman-name").value;
+    if (!name) return;
+
+    showSaving();
+    if (editingDeptId) {
+      const d = db.departments.find((item) => item.id === editingDeptId);
+      d.name = name;
+      d.keymanRole = role;
+      d.keymanName = kname;
+      google.script.run
+        .withSuccessHandler(() => {
+          showSuccess();
+          cancelEditDept();
+          renderBasicInfo();
+        })
+        .withFailureHandler((e) => showError(e, "部署の保存に失敗しました"))
+        .updateDepartment(d);
+    } else {
+      const newDept = {
+        id: "d" + Date.now(),
+        accountId: t3HospId,
+        name,
+        keymanRole: role,
+        keymanName: kname,
+      };
+      db.departments.push(newDept);
+      google.script.run
+        .withSuccessHandler(() => {
+          showSuccess();
+          cancelEditDept();
+          renderBasicInfo();
+        })
+        .withFailureHandler((e) => showError(e, "部署の保存に失敗しました"))
+        .saveDepartment(newDept);
+    }
+  }
+
+  function delDept(id) {
+    const dept = db.departments.find((d) => d.id === id);
+    if (!dept) return;
+
+    // 1. 警告アラートを表示
+    const msg = `部署「${dept.name}」を完全に削除しますか？\n\nこの部署に紐づくすべての「案件状況」と「活動ログ」も削除され、元に戻せません。`;
+
+    showConfirm(msg, "⚠️ 削除の確認", () => {
+      showSaving();
+
+      // 2. ログ削除のために、関連する案件IDを特定しておく
+      const relatedProjectIds = db.projects
+        .filter((p) => p.departmentId === id)
+        .map((p) => p.id);
+
+      // 3. GAS側の連動削除関数を実行
+      google.script.run
+        .withSuccessHandler(() => {
+          // 4. 成功したらメモリ上のデータ（db）も一括で削除
+          db.departments = db.departments.filter((d) => d.id !== id);
+          db.projects = db.projects.filter((p) => p.departmentId !== id);
+          db.logs = db.logs.filter(
+            (l) => !relatedProjectIds.includes(l.projectId),
+          );
+
+          showSuccess();
+          // 再描画（タブ3なので取引先詳細を更新）
+          changeAccount(3, t3HospId);
+        })
+        .withFailureHandler((e) => showError(e, "部署の削除に失敗しました"))
+        .deleteDepartmentWithCascade(id);
+    });
+  }
+</script>

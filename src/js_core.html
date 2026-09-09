@@ -1,0 +1,231 @@
+<script>
+  /**
+   * js_core.html
+   * アプリ全体の状態管理 (State) と共通ユーティリティを定義します。
+   */
+
+  // --- グローバル状態管理 (State) ---
+  let db = {
+    accounts: [],
+    departments: [],
+    projects: [],
+    logs: [],
+    reviews: {},
+    checkItems: [],
+    masterAccounts: [],
+    activePlans: [],
+    campaigns: [],
+    otherAccounts: [],
+  };
+
+  // 編集・ユーザー状態
+  let currentHospNameFilter = "";
+  let editingDeptId = null;
+  let editingProjectId = null;
+  let editingLogId = null;
+  let currentUserEmail = "";
+  let currentUserRole = "";
+  let targetUserId = "";
+  let allUsers = [];
+  let currentTargetUserT0 = "self";
+  let currentTargetUserT1 = "self";
+  const otherAccountCache = {};
+  const _prefetchPromise = {};
+
+  function _escapeHtml(value) {
+    return String(value == null ? "" : value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function _safeUrl(url) {
+    if (!url) return "";
+    const raw = String(url).trim();
+    const s = raw.toLowerCase();
+    if (s.startsWith("javascript:") || s.startsWith("data:")) return "";
+    return raw;
+  }
+
+  function _escapeInlineJsString(value) {
+    return _escapeHtml(
+      String(value == null ? "" : value)
+        .replace(/\\/g, "\\\\")
+        .replace(/'/g, "\\'")
+        .replace(/\r/g, "\\r")
+        .replace(/\n/g, "\\n")
+        .replace(/\u2028/g, "\\u2028")
+        .replace(/\u2029/g, "\\u2029"),
+    );
+  }
+
+  // 表示用定数
+  const STAGE_LABELS = [
+    "0：未接触",
+    "1：初回訪問済",
+    "2：ニーズ確認中",
+    "3：提案実施中",
+    "4：クロージング",
+  ];
+
+  // ユーティリティ
+  function $(id) {
+    return document.getElementById(id);
+  }
+
+  let _overlayCount = 0;
+
+  function showOverlay(message = "クラウドに保存しています...") {
+    const overlay = $("overlay");
+    if (!overlay) return;
+    _overlayCount++;
+    const box = overlay.querySelector(".overlay-box");
+    if (box) box.textContent = message;
+    overlay.style.display = "flex";
+  }
+
+  function hideOverlay() {
+    _overlayCount = Math.max(0, _overlayCount - 1);
+    if (_overlayCount === 0 && $("overlay")) $("overlay").style.display = "none";
+  }
+
+  function showSaving() {
+    showOverlay("クラウドに保存しています...");
+  }
+
+  function showSuccess() {
+    hideOverlay();
+    const t = $("toast");
+    if (!t) return;
+    t.style.opacity = "1";
+    clearTimeout(window._toastTimer);
+    window._toastTimer = setTimeout(() => {
+      t.style.opacity = "0";
+    }, 2000);
+  }
+
+  function showAlert(message, title = "通知", isError = false) {
+    Swal.fire({
+      title: title,
+      html: _escapeHtml(message).replace(/\n/g, "<br>"),
+      icon: isError ? "error" : "info",
+      confirmButtonColor: isError ? "#DC2626" : "#0891b2",
+      confirmButtonText: "OK",
+    });
+  }
+
+  function showConfirm(message, title, onConfirm, confirmText = "削除する") {
+    Swal.fire({
+      title: title,
+      html: _escapeHtml(message).replace(/\n/g, "<br>"),
+      icon: "warning",
+      showCancelButton: true,
+      confirmButtonColor: "#DC2626",
+      cancelButtonColor: "#6b7280",
+      confirmButtonText: confirmText,
+      cancelButtonText: "キャンセル",
+    }).then((result) => {
+      if (result.isConfirmed && onConfirm) onConfirm();
+    });
+  }
+
+  function showError(e, context = "") {
+    hideOverlay();
+    console.error(e);
+    const detail = e.message || String(e);
+    const msg = context ? `${context}\n\n詳細: ${detail}` : `詳細: ${detail}`;
+    Swal.fire({
+      title: "エラーが発生しました",
+      html: _escapeHtml(msg).replace(/\n/g, "<br>"),
+      icon: "error",
+      confirmButtonColor: "#DC2626",
+      confirmButtonText: "OK",
+    });
+  }
+
+  function showErrorWithRetry(e, context, retryFn) {
+    hideOverlay();
+    console.error(e);
+    const detail = e.message || String(e);
+    const msg = context ? `${context}\n\n詳細: ${detail}` : `詳細: ${detail}`;
+    Swal.fire({
+      title: "エラーが発生しました",
+      html: _escapeHtml(msg).replace(/\n/g, "<br>"),
+      icon: "error",
+      showCancelButton: true,
+      confirmButtonColor: "#0891b2",
+      cancelButtonColor: "#6b7280",
+      confirmButtonText: "再試行",
+      cancelButtonText: "閉じる",
+    }).then((result) => {
+      if (result.isConfirmed && retryFn) retryFn();
+    });
+  }
+
+  function _skeletonCard(lines) {
+    const linesHtml = lines
+      .map((w) => `<div class="sk-line" style="height:12px; width:${w};"></div>`)
+      .join("");
+    return `<div class="sk-block">${linesHtml}</div>`;
+  }
+
+  function initSkeletons() {
+    const cards =
+      _skeletonCard(["35%", "65%", "50%"]) +
+      _skeletonCard(["40%", "70%", "55%"]) +
+      _skeletonCard(["30%", "60%"]);
+
+    const targets = [
+      "summary-integrated-list",
+      "summary-logs",
+      "dash-active-projects",
+      "dash-recent-logs",
+    ];
+    targets.forEach((id) => {
+      const el = $(id);
+      if (el) el.innerHTML = cards;
+    });
+  }
+
+  // --- アプリケーション共通の実行ラッパー ---
+  const AppCore = {
+    state: { activeTab: 0 },
+
+    run: function (serverMethod, args = []) {
+      return new Promise((resolve, reject) => {
+        showSaving();
+        google.script.run
+          .withSuccessHandler((result) => {
+            showSuccess();
+            resolve(result);
+          })
+          .withFailureHandler((error) => {
+            showError(error);
+            reject(error);
+          })
+          [serverMethod](...args);
+      });
+    },
+
+    switchTab: function (index) {
+      this.state.activeTab = index;
+      const contents = document.querySelectorAll(".content");
+      const tabs = document.querySelectorAll(".tab");
+      contents.forEach((el, i) => el.classList.toggle("active", i === index));
+      tabs.forEach((el, i) => el.classList.toggle("active", i === index));
+
+      // 表示の更新が必要な場合は renderAll を呼び出す
+      if (typeof renderAll === "function") renderAll();
+    },
+
+    init: function () {
+      console.log("AppCore initialized.");
+      // 既存の js.html にある init 関数を呼び出します
+      if (typeof init === "function") init();
+    },
+  };
+
+  document.addEventListener("DOMContentLoaded", () => AppCore.init());
+</script>

@@ -1,0 +1,256 @@
+<script>
+  // js_quick_add.html — クイック登録モーダル
+
+  let qaCurrentMode = "full"; // 'full' or 'project'
+
+  function nextQaStep() {
+    const hName = $("qa-h-name").value;
+    if (!hName) {
+      showAlert("取引先名を入力してください", "入力チェック");
+      return;
+    }
+
+    const dupMsg = _checkDuplicateAccount(
+      hName,
+      $("qa-h-code") ? $("qa-h-code").value : "",
+      "",
+    );
+    if (dupMsg) {
+      showAlert(dupMsg, "重複エラー", true);
+      return; // 重複がある場合はエラーを出して画面遷移をストップ
+    }
+
+    $("qa-screen-hosp").style.display = "none";
+    $("qa-screen-proj").style.display = "block";
+  }
+
+  function prevQaStep() {
+    $("qa-screen-proj").style.display = "none";
+    $("qa-screen-hosp").style.display = "block";
+  }
+
+  function openQuickAddModal(mode) {
+    qaCurrentMode = mode;
+
+    // フォームのリセット
+    $("qa-proj-name").value = "";
+    $("qa-proj-target").value = "";
+    $("qa-new-dept-name").value = "";
+    $("qa-new-dept-role").value = "";
+    $("qa-new-dept-keyman").value = "";
+
+    if (mode === "full") {
+      $("qa-modal-title").innerHTML = "🏥取引先・部署・案件の登録";
+      $("qa-step-hosp").style.display = "block";
+      $("qa-screen-hosp").style.display = "block";
+      $("qa-screen-proj").style.display = "none";
+      $("btn-qa-back").textContent = "戻る";
+      $("btn-qa-back").onclick = prevQaStep;
+      initQaRefSelectors();
+      // 取引先用フィールドのリセット
+      ["name", "addr", "partner", "equipment", "note", "code"].forEach(
+        (f) => ($(`qa-h-${f}`).value = ""),
+      );
+      $("qa-h-priority").value = "mid";
+
+      // 部署は「新規」のみ
+      $("qa-dept-select").innerHTML =
+        `<option value="NEW">＋ 新しい部署を登録する</option>`;
+      $("qa-dept-select").value = "NEW";
+      toggleQaDeptFields();
+    } else if (mode === "project") {
+      if (!t0HospId || t0HospId === "new") {
+        showAlert("先に取引先を選択してください。", "入力チェック");
+        return;
+      }
+      $("qa-modal-title").innerHTML = "🚀 部署・案件の追加";
+      $("qa-screen-hosp").style.display = "none";
+      $("qa-screen-proj").style.display = "block";
+      $("btn-qa-back").textContent = "キャンセル";
+      $("btn-qa-back").onclick = closeQuickAddModal;
+
+      const depts = db.departments.filter((d) => d.accountId === t0HospId);
+      let dHtml = `<option value="NEW">＋ 新しい部署を登録する</option>`;
+      dHtml += depts
+        .map((d) => `<option value="${d.id}">${d.name}</option>`)
+        .join("");
+      $("qa-dept-select").innerHTML = dHtml;
+      toggleQaDeptFields();
+    }
+
+    if (typeof populateCampaignDatalist === "function") populateCampaignDatalist();
+    $("quick-add-modal").style.display = "flex";
+  }
+
+  function closeQuickAddModal(skipProjectRestore) {
+    $("quick-add-modal").style.display = "none";
+    if (!skipProjectRestore && window._logProjSelectPrev != null) {
+      const sel = $("log-proj-select");
+      if (sel) sel.value = window._logProjSelectPrev;
+      window._logProjSelectLast = window._logProjSelectPrev;
+      window._logProjSelectPrev = undefined;
+      loadProjectDataToForm();
+    } else if (!skipProjectRestore) {
+      window._logProjSelectPrev = undefined;
+    }
+  }
+
+  function toggleQaDeptFields() {
+    $("qa-new-dept-fields").style.display =
+      $("qa-dept-select").value === "NEW" ? "block" : "none";
+  }
+
+  async function executeQuickAdd() {
+    if (!$("qa-proj-name").value) {
+      showAlert("案件名は必須です", "入力チェック");
+      return;
+    }
+    showSaving();
+
+    try {
+      let targetHospId = t0HospId;
+      let targetDeptId = $("qa-dept-select").value;
+
+      // 1. 取引先登録（フルモード時）
+      if (qaCurrentMode === "full") {
+        const hName = $("qa-h-name").value;
+        if (!hName) throw new Error("取引先名を入力してください");
+
+        targetHospId = "a" + Date.now();
+        const newHosp = {
+          id: targetHospId,
+          code: $("qa-h-code") ? $("qa-h-code").value : "",
+          name: hName,
+          addr: $("qa-h-addr") ? $("qa-h-addr").value : "",
+          corp: "",
+          beds: "",
+          partner: $("qa-h-partner") ? $("qa-h-partner").value : "",
+          deptList: "",
+          ward: "",
+          priority: $("qa-h-priority") ? $("qa-h-priority").value : "mid",
+          equipment: $("qa-h-equipment") ? $("qa-h-equipment").value : "",
+          note: $("qa-h-note") ? $("qa-h-note").value : "",
+          assignedUserId: currentUserEmail,
+        };
+        await new Promise((res, rej) =>
+          google.script.run
+            .withSuccessHandler(res)
+            .withFailureHandler(rej)
+            .saveNewAccount(newHosp),
+        );
+        db.accounts.push(newHosp);
+      }
+
+      // 2. 部署登録
+      if (targetDeptId === "NEW") {
+        const dName = $("qa-new-dept-name").value;
+        if (!dName) throw new Error("部署名を入力してください");
+        targetDeptId = "d" + Date.now();
+        const newDept = {
+          id: targetDeptId,
+          accountId: targetHospId,
+          name: dName,
+          keymanRole: $("qa-new-dept-role").value,
+          keymanName: $("qa-new-dept-keyman").value,
+        };
+        await new Promise((res, rej) =>
+          google.script.run
+            .withSuccessHandler(res)
+            .withFailureHandler(rej)
+            .saveDepartment(newDept),
+        );
+        db.departments.push(newDept);
+      }
+
+      // 3. 案件登録
+      const newProjId = "p" + Date.now();
+      const newProj = {
+        id: newProjId,
+        departmentId: targetDeptId,
+        accountId: targetHospId,
+        name: $("qa-proj-name").value,
+        targetProduct: $("qa-proj-target").value,
+        currentStage: "0",
+      };
+      await new Promise((res, rej) =>
+        google.script.run
+          .withSuccessHandler(res)
+          .withFailureHandler(rej)
+          .saveProject(newProj),
+      );
+      db.projects.push(newProj);
+
+      // 4. UI反映
+      showSuccess();
+      closeQuickAddModal(true);
+      window._logProjSelectPrev = undefined;
+
+      if (qaCurrentMode === "full") {
+        updateAccountSelectOptions();
+        t0HospId = targetHospId;
+        $("t0-account").value = targetHospId;
+        changeAccount(0, targetHospId); // 取引先切り替え処理を実行
+      } else {
+        renderActivities(); // 既存取引先なら案件リストのみ再描画
+      }
+
+      // 新規作成した案件を選択状態にしてフォームを更新
+      $("log-proj-select").value = newProjId;
+      window._logProjSelectLast = newProjId;
+      loadProjectDataToForm();
+    } catch (e) {
+      showError(e, "クイック登録に失敗しました");
+    }
+  }
+
+  // マスター参照用ロジック（クイック登録モーダル用）
+  function initQaRefSelectors() {
+    if (!db.masterAccounts || db.masterAccounts.length === 0) return;
+    const offices = [
+      ...new Set(db.masterAccounts.map((m) => m.office)),
+    ].sort();
+    $("qa-ref-office").innerHTML =
+      '<option value="">-- 拠点を選択 --</option>' +
+      offices.map((o) => `<option value="${o}">${o}</option>`).join("");
+    $("qa-ref-partner").innerHTML =
+      '<option value="">-- 先に拠点を選択 --</option>';
+    $("qa-ref-hosp").innerHTML = '<option value="">-- 先にMSを選択 --</option>';
+  }
+
+  function updateQaRefPartnerOptions() {
+    const off = $("qa-ref-office").value;
+    const partnerList = [
+      ...new Set(
+        db.masterAccounts.filter((m) => m.office === off).map((m) => m.partner),
+      ),
+    ].sort();
+    $("qa-ref-partner").innerHTML =
+      '<option value="">-- 担当MSを選択 --</option>' +
+      partnerList.map((m) => `<option value="${m}">${m}</option>`).join("");
+    $("qa-ref-hosp").innerHTML = '<option value="">-- 先にMSを選択 --</option>';
+  }
+
+  function updateQaRefAccountOptions() {
+    const off = $("qa-ref-office").value;
+    const partner = $("qa-ref-partner").value;
+    const hosps = db.masterAccounts.filter(
+      (m) => m.office === off && m.partner === partner,
+    );
+    $("qa-ref-hosp").innerHTML =
+      '<option value="">-- 取引先を選択 --</option>' +
+      hosps
+        .map((h) => `<option value="${h.code}">[${h.code}] ${h.name}</option>`)
+        .join("");
+  }
+
+  function applyQaRefData() {
+    const code = $("qa-ref-hosp").value;
+    const h = db.masterAccounts.find((m) => String(m.code) === code);
+    if (h) {
+      $("qa-h-name").value = h.name;
+      $("qa-h-addr").value = h.address || "";
+      $("qa-h-partner").value = h.partner;
+      $("qa-h-code").value = h.code;
+    }
+  }
+</script>
