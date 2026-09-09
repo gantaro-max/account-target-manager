@@ -112,7 +112,7 @@ GASには1実行あたり6分の制限があり、`google.script.run` の往復�
 | [MANUAL_MANAGER.md](docs/MANUAL_MANAGER.md) | 管理者向け操作説明書 |
 | [PATTERNS.md](docs/PATTERNS.md) | 実装パターン早見表（レビューの判断基準） |
 | [TASKS.md](docs/TASKS.md) | 開発タスク・既知の制限事項 |
-| `docs/archive/` | 実装指示書のアーカイブ（36本） |
+| `docs/archive/` | 実装指示書のアーカイブ（35本） |
 
 ---
 
